@@ -59,8 +59,12 @@ class WindowInfo:
 
     @property
     def key(self) -> tuple:
-        """이 값이 바뀌면 '다른 창으로 전환했다'고 본다."""
-        return (self.exe, self.title, self.url)
+        """
+        이 값이 바뀌면 '다른 창으로 전환했다'고 본다.
+        제목은 넣지 않는다 — 터미널 스피너·알림 개수처럼 제목만 깜빡이면 세션이
+        1초 단위로 쪼개지기 때문. 브라우저는 URL이 바뀔 때만 새 세션이다.
+        """
+        return (self.exe, self.url)
 
 
 # =============================================================================
@@ -190,6 +194,20 @@ class WindowsProbe:
         """
         return bool(self.user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0))
 
+    def mute_app(self, exe: str, mute: bool) -> bool:
+        """그 앱(예: chrome.exe)의 소리만 끄거나 켠다 — Windows 볼륨 믹서와 같은 방식. pycaw 필요."""
+        try:
+            from pycaw.pycaw import AudioUtilities
+        except ImportError:
+            print("[!] pycaw 미설치 — 소리 끄기를 건너뜁니다.  pip install pycaw")
+            return False
+        found = False
+        for s in AudioUtilities.GetAllSessions():
+            if s.Process and s.Process.name().lower() == exe.lower():
+                s.SimpleAudioVolume.SetMute(int(mute), None)
+                found = True
+        return found
+
     VK_CONTROL, VK_W, KEYEVENTF_KEYUP = 0x11, 0x57, 0x0002
 
     def close_tab(self, hwnd: int) -> bool:
@@ -251,6 +269,10 @@ class SimulatedProbe:
         print(f"      (시뮬레이터: hwnd={hwnd} 에 Ctrl+W 보냈다고 가정)")
         return True
 
+    def mute_app(self, exe: str, mute: bool) -> bool:
+        print(f"      (시뮬레이터: {exe} 소리 {'끔' if mute else '켬'})")
+        return True
+
 
 # =============================================================================
 #  로직 부분 1 — 규칙 엔진
@@ -262,7 +284,7 @@ class SimulatedProbe:
 class Condition:
     group_no: int
     subject: str        # 'app' | 'url' | 'window_title'
-    operator: str       # 'eq' | 'contains' | 'regex'
+    operator: str       # 'eq' | 'contains' | 'regex' | 'not_regex'(이 패턴이 없어야 맞음)
     value: str
 
 
@@ -270,10 +292,11 @@ class Condition:
 class Rule:
     rule_id: str
     name: str
-    action: str         # 'close' | 'warn' | 'delay' | 'mute'
+    action: str         # 고양이가 올라갈 수 있는 최대 단계: 'warn' < 'mute' < 'delay' < 'close'
     priority: int
     conditions: tuple[Condition, ...]
-    reaction: str = ""
+    reaction: str = ""       # {minutes} 가 있으면 누적 분으로 채운다
+    min_minutes: int = 0     # 0이면 창을 열자마자, N이면 오늘 그 사이트/앱 누적 N분마다 발동
 
 
 def _subject_value(win: WindowInfo, subject: str) -> Optional[str]:
@@ -294,6 +317,8 @@ def _test(cond: Condition, win: WindowInfo) -> bool:
         return cond.value.lower() in actual.lower()
     if cond.operator == "regex":
         return re.search(cond.value, actual, re.IGNORECASE) is not None
+    if cond.operator == "not_regex":
+        return re.search(cond.value, actual, re.IGNORECASE) is None
     return False
 
 
@@ -313,11 +338,15 @@ def pick_rule(rules: Iterable[Rule], win: WindowInfo) -> Optional[Rule]:
     return min(matched, key=lambda r: r.priority) if matched else None
 
 
+# 영상 제목에 이 말이 있으면 '공부·음악 용도'로 보고 유튜브 시간에서 뺀다.
+STUDY_WORDS = ("강의|수업|공부|인강|lecture|study|tutorial|course|코딩|파이썬|python"
+               "|노래|음악|music|lofi|플레이리스트|playlist")
+
 # 기본 규칙 — 나중에 이 리스트가 DB의 block_rule 테이블로 옮겨간다.
 DEFAULT_RULES: tuple[Rule, ...] = (
     Rule(
         rule_id="r_shorts", name="유튜브 쇼츠 차단", action="close", priority=10,
-        reaction="또 보는 거야? 닫는다.",
+        reaction="또 쇼츠야?",
         conditions=(
             Condition(0, "url", "contains", "youtube.com/shorts"),
         ),
@@ -333,12 +362,13 @@ DEFAULT_RULES: tuple[Rule, ...] = (
         ),
     ),
     Rule(
-        rule_id="r_yt_warn", name="유튜브 경고", action="warn", priority=50,
-        reaction="30분째야.",
+        rule_id="r_yt_warn", name="유튜브 (공부·음악 제외)", action="close", priority=50,
+        reaction="유튜브 {minutes}분째야.", min_minutes=5,
         conditions=(
-            # group 0 AND group 1 — 크롬이면서(AND) 유튜브여야 한다
+            # group 0 AND group 1 AND group 2 — 크롬이면서, 유튜브이고, 공부·음악 영상이 아니어야 한다
             Condition(0, "app", "eq", "chrome.exe"),
             Condition(1, "url", "contains", "youtube.com"),
+            Condition(2, "window_title", "not_regex", STUDY_WORDS),
         ),
     ),
 )
@@ -388,7 +418,7 @@ class SessionTracker:
     def observe(self, win: Optional[WindowInfo], elapsed: float, idle: bool) -> bool:
         """창을 관찰한다. 새 세션이 시작됐으면 True."""
         key = (win.key if win else None, idle)
-        cur_key = ((self.current.exe, self.current.title, self.current.url),
+        cur_key = ((self.current.exe, self.current.url),
                    self.current.is_idle) if self.current else None
 
         if self.current and key == cur_key:

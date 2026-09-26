@@ -1,4 +1,4 @@
-> 고양이 앱 DB는 테이블 4개. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
+> 고양이 앱 DB는 테이블 9개 (스키마 v5). **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
 
 - 코드: `cat_app.py`의 `SCHEMA` · DB 파일: `%LOCALAPPDATA%\cat-app\cat.db` (개인정보라 OneDrive·git 밖 PC 로컬에 둠)
 - 관련: [[진행도]] · [[고양이-생산성-앱-프로젝트]] · [[프로젝트 일정]]
@@ -10,21 +10,66 @@
 erDiagram
     block_rule ||--o{ rule_condition : "조건 (CASCADE)"
     block_rule ||--o{ block_event : "발동 기록 (SET NULL)"
+    usage_session }o..|| daily_summary : "하루가 끝나면 요약 (90일 뒤 원본 삭제)"
+    block_event }o..|| daily_summary : "숏폼 감지·닫은 횟수 요약"
+
+    daily_summary {
+        TEXT day PK "현지 날짜"
+        TEXT exe PK
+        TEXT url_host PK "'' = 웹 아님"
+        REAL minutes
+        INTEGER sessions
+        INTEGER shorts_seen
+        INTEGER shorts_closed
+    }
+    focus_task ||--o{ allow_item : "허용 목록 (CASCADE)"
+    focus_task ||--o{ focus_checkin : "어디야? 확인"
+    focus_task ||--o{ usage_session : "그때 할 일"
+
+    focus_task {
+        INTEGER task_id PK
+        TEXT name UK "파이썬 강의"
+        TEXT created_at
+    }
+    allow_item {
+        INTEGER item_id PK
+        INTEGER task_id FK
+        TEXT kind "app/host/playlist/keyword"
+        TEXT value
+        INTEGER learned "1=고양이가 물어보고 배움"
+    }
+    focus_checkin {
+        INTEGER checkin_id PK
+        INTEGER task_id FK
+        TEXT asked_at
+        TEXT answered_at "NULL=대답 안 함"
+        TEXT answer "focus/break"
+        TEXT note "어디까지 했어?"
+    }
+    cat_memory {
+        INTEGER memory_id PK
+        TEXT day
+        TEXT kind "carrot/stick/training"
+        TEXT reason
+        INTEGER points "당근 +, 채찍 -"
+        TEXT created_at
+    }
 
     block_rule {
         TEXT rule_id PK "예: r_shorts"
         TEXT name
-        TEXT action "close/warn/delay/mute"
+        TEXT action "최대 단계: warn<mute<delay<close"
         INTEGER priority "작을수록 우선"
         TEXT reaction "고양이 대사"
         INTEGER enabled "0/1"
+        INTEGER min_minutes "v1: 0=즉시, N=오늘 누적 N분마다"
     }
     rule_condition {
         INTEGER condition_id PK
         TEXT rule_id FK
         INTEGER group_no "같으면 OR, 다르면 AND"
         TEXT subject "app/url/window_title"
-        TEXT operator "eq/contains/regex"
+        TEXT operator "eq/contains/regex/not_regex(v4)"
         TEXT value
     }
     block_event {
@@ -34,14 +79,21 @@ erDiagram
         TEXT action
         TEXT exe
         TEXT url_host
+        TEXT mode "v1: log(감시)/close(업무)"
+        TEXT response "v4: 실제 행동 warn/mute/delay/close"
+        INTEGER executed "v1: 그 행동이 성공했나 1/0"
+        INTEGER minutes "v1: 누적 시간 규칙이면 그때 분"
     }
     usage_session {
         INTEGER session_id PK
         TEXT started_at "UTC, 인덱스"
         TEXT ended_at
         TEXT exe
-        TEXT window_title "민감: 로컬 전용"
-        TEXT url_host "호스트만"
+        TEXT window_title "로컬 전용 (영상 제목 등)"
+        TEXT url_host "집계용"
+        TEXT url "v1: 전체 주소 (쇼츠/강의 구분)"
+        TEXT verdict "v5: focus/distract/unknown/away"
+        INTEGER task_id FK "v5: 그때 할 일"
         REAL duration_sec
         INTEGER is_idle "0/1"
     }
@@ -60,6 +112,7 @@ erDiagram
 | `action` CHECK | 4개 값만 허용. 오타가 저장되는 것을 DB가 막음 |
 | `priority` | 여러 규칙이 동시에 맞으면 작은 숫자가 이김 (쇼츠: close 10 > warn 50) |
 | `enabled` | 지우지 않고 끄기만 함 → 과거 block_event가 어떤 규칙이었는지 유지 |
+| `min_minutes` (v1) | 0이면 창을 열자마자, N이면 **오늘 그 사이트/앱 누적 N분마다** 발동. `reaction`의 `{minutes}`에 누적 분이 들어감 → "유튜브 5분째야", "유튜브 10분째야" (v2부터 5분 단위) |
 
 ### rule_condition: 언제 발동하나 ⭐
 **같은 `group_no` = OR, 다른 `group_no` = AND** → 테이블 하나로 "(A 또는 B) 그리고 (C 또는 D)"를 표현한다.
@@ -72,18 +125,85 @@ erDiagram
 `ON DELETE CASCADE`: 규칙을 지우면 조건도 함께 삭제된다 (주인 없는 조건 방지).
 
 ### usage_session: 어떤 창을 얼마나 봤나
-창이 바뀔 때마다 한 줄씩 기록한다.
+**앱이 바뀌거나 (브라우저는) 주소가 바뀔 때** 한 줄씩 기록한다. 창 제목만 바뀌는 건(터미널 스피너, 알림 개수) 같은 세션이다. **1초 이하 세션은 저장하지 않는다.**
 
 | 컬럼 | 이유 |
 |---|---|
 | `started_at` UTC | 저장은 UTC, 조회 시 `date(started_at, 'localtime')` → 시간대 혼동 방지 |
-| `url_host` | 전체 URL 대신 `youtube.com`만 남김 (개인정보 최소화) |
-| `window_title` | 문서 이름 등 민감 정보가 있을 수 있어 로컬 전용 |
+| `url_host` | `youtube.com`처럼 사이트 단위 집계용 (누적 분 계산도 이걸로) |
+| `url` (v1) | 전체 주소. 쇼츠인지 강의인지 구분 → **당근/채찍 판단 재료**. 로컬 전용 |
+| `window_title` | 영상·문서 제목. 당근/채찍 판단 재료. 로컬 전용 |
 | `is_idle` | 자리 비움 시간. 통계에서 제외 |
 | 인덱스 `ix_session_started` | "오늘 기록" 조회가 잦고 로그가 계속 쌓이므로 |
 
 ### block_event: 고양이가 언제 막았나
 `ON DELETE SET NULL`: 규칙을 지워도 기록은 남고 `rule_id`만 비워진다 (과거 기록 보존).
+
+| 컬럼 (v1) | 이유 |
+|---|---|
+| `mode` | 그때 모드. 감시 모드에서 쇼츠를 본 것과 업무모드에서 고양이가 막은 것은 의미가 다르다 |
+| `executed` | 실제로 닫았는지. 업무모드여도 그 사이 창이 바뀌면 안 닫는다. v0 기록은 NULL(알 수 없음) |
+| `minutes` | "N분째야" 경고가 몇 분 시점에 나왔는지 |
+
+## 스키마 버전 관리 (마이그레이션)
+- DB 파일 안의 `PRAGMA user_version`에 **몇 번째 변경까지 적용됐는지** 저장한다.
+- 앱이 켜질 때 `MIGRATIONS` 목록 중 아직 안 된 것만 순서대로 적용 (`migrate()`). 하나의 변경은 한 트랜잭션이라 중간에 실패하면 통째로 취소.
+- 규칙: **이미 배포된 변경은 고치지 않고, 새 변경은 맨 뒤에 추가만** 한다.
+
+| 버전 | 내용 |
+|---|---|
+| v0 | 테이블 4개 (최초) |
+| v5 (2026-09-26) | `focus_task`, `allow_item`, `focus_checkin` 추가 · `usage_session.verdict/task_id` · `daily_summary` 집중·딴짓·모름 분 · 백업 `cat.backup-v4.db` |
+| v4 (2026-09-26) | 반응 단계 도입: `block_rule.action`은 **최대 단계**, `block_event.response`에 실제 행동 기록 · `rule_condition.operator`에 `not_regex` 추가 (CHECK 변경이라 테이블 재생성) · 유튜브 규칙에 "공부·음악 제목 제외" 조건 · 백업 `cat.backup-v3.db` |
+| v3 (2026-09-26) | `daily_summary`, `cat_memory` 테이블 추가 · `block_event.occurred_at` 인덱스 · 원본 90일 보관 정책 (`RETENTION_DAYS`) |
+| v2 (2026-09-26) | 유튜브 경고 기준 30분 → **5분마다** (값이 30인 경우만 변경) |
+| v1 (2026-09-26) | `usage_session.url`, `block_event.mode/executed/minutes`, `block_rule.min_minutes` 추가 · 경고 규칙을 "누적 30분마다"로 변경 · 1초 이하 세션 삭제 (실제 DB: 698건 → 241건, 백업 `cat.backup-2026-09-26.db`) |
+
+### daily_summary · cat_memory: 고양이의 영구 기억 (v3)
+| 구분 | 테이블 | 보관 | 이유 |
+|---|---|---|---|
+| 원본 | `usage_session`, `block_event` | **90일** | 1초 단위 상세 기록. 하루 수백 건 → 계속 두면 커짐 |
+| 기억 | `daily_summary` | 영구 | 하루 20줄 안팎 → 10년 쌓여도 몇 MB. 훈련(평소 기준) 계산 재료 |
+| 기억 | `cat_memory` | 영구 | 🥕 당근 / 🪓 채찍 / 🧠 훈련 기록. `kind`는 CHECK로 3가지만 허용 |
+
+`summarize_and_prune()` (앱이 켜질 때마다):
+1. 어제까지 중 **아직 요약 안 된 날**을 `daily_summary`로 요약 (오늘은 아직 안 끝났으니 제외)
+2. **요약이 끝난 날** 중 90일 넘은 원본만 삭제
+3. ①②가 한 트랜잭션 → 요약이 실패하면 삭제도 안 일어남. 여러 번 실행해도 결과 동일
+
+`url_host`에 NULL 대신 `''`를 쓰는 이유: 기본키(PK) 컬럼은 NULL이면 중복 판정이 안 된다.
+
+**훈련 기억 아이디어:** `daily_summary`로 최근 7일 평균 유튜브 분을 계산 → 오늘이 평균보다 적으면 🥕, 많으면 🪓 → 결과를 `cat_memory`에 남김. (점수 규칙은 추후 결정)
+
+## 업무·공부 판정 (v5)
+**"공부 중"** = 맨 앞 창이 그 할 일의 **허용 목록**에 있고, 20분마다 묻는 **"어디야?"에 대답**하는 상태.
+
+| 판정 (`usage_session.verdict`) | 조건 (위에서부터 먼저) |
+|---|---|
+| 😼 `distract` | 차단 규칙(쇼츠·오락 유튜브)에 걸림 |
+| 사용자가 이번 실행에서 답함 | "이번만" → focus, "아니, 딴짓" → distract |
+| 📚 `focus` | 허용 목록에 있음 (앱 / 사이트 / 재생목록 `list=` / 제목 키워드), 또는 브라우저 제목에 강의·음악 단어 (보조) |
+| ❓ `unknown` | 그 밖 → 업무모드에서 30초 넘으면 "이것도 공부야?" |
+| 💤 `away` | "어디야?"에 3분 넘게 대답 없음, 또는 입력 없고 공부 창도 아님 |
+
+- **재생목록이 핵심**: 유튜브 재생목록에서 다음 영상으로 넘어가면 `v=`만 바뀌고 `&list=`는 그대로라서, 재생목록을 한 번 등록하면 강의·음악이 이어져도 계속 허용된다.
+- 공부 창에서는 키보드·마우스 입력이 없어도 자리 비움으로 보지 않는다 (강의 시청). 대신 20분 확인으로 판단한다.
+- "응, 기억해" → `allow_item.learned = 1` + `cat_memory`에 `training` 기록 → 쓸수록 덜 묻는다.
+- `daily_summary`에 `focus_minutes / distract_minutes / unknown_minutes` 추가 → 채찍·당근 점수 재료.
+
+## 고양이 반응 단계 (v4)
+`LADDER = warn → mute → delay → close`. 규칙의 `action`은 "여기까지 올라갈 수 있다"는 **최대 단계**다.
+
+| | 쇼츠·릴스 (`min_minutes = 0`) | 유튜브 (`min_minutes = 5`) |
+|---|---|---|
+| 단계(level) | 오늘 이 규칙 발동 횟수 (`block_event` COUNT) | 오늘 누적 분 ÷ 5 − 1 |
+| 누적 분 계산 | 저장된 제목·주소를 **규칙에 다시 대 봐서** 걸리는 세션만 합산 → 공부 영상 시간은 빠짐 | 같음 |
+
+- 업무모드: `LADDER[min(level, 최대 단계)]`
+- 감시 모드: 말하기만. 단, 오늘 누적 60분 이상이면 소리 끄기
+- 소리를 끈 뒤 규칙에 안 걸리는 창으로 옮기거나 앱이 끝나면 다시 켠다
+- 유튜브 제외 조건: `window_title not_regex "강의|수업|공부|…|노래|음악|lofi|플레이리스트"` (`watch.py`의 `STUDY_WORDS`)
+- 숏폼 집계(`daily_summary.shorts_seen`, 리포트)는 **즉시 판정 규칙(`min_minutes = 0`)의 발동만** 센다 → 유튜브 N분 알림은 섞이지 않는다
 
 ## 주요 쿼리
 
@@ -113,7 +233,9 @@ WHERE r.enabled = 1;
 |---|---|---|
 | `app` 테이블 분리 | exe 문자열 반복 저장 (의도적 반정규화). 앱 이름은 안 바뀜 | 앱별 아이콘·카테고리(업무/여가)를 붙일 때 |
 | 사용자 테이블 | 1 PC 1 사용자 | 다중 사용자 |
-| 시간 조건 (업무시간만 차단) | 스파이크에서 보류 | `subject`에 `'time'` 추가 |
+| 채찍·당근 점수 규칙 | 기억 테이블만 먼저 만듦 (v3) | 당근/채찍 기능 구현 때 |
+| 공부 판별 고도화 | 지금은 제목 키워드만 봄 | 채널 목록, 시청 패턴으로 판별할 때 |
+| 시간대 조건 (업무시간만 차단) | 스파이크에서 보류. 누적 시간 조건은 v1에서 `min_minutes`로 해결 | `subject`에 `'time'` 추가 |
 | 실행 중 규칙 갱신 | 규칙은 앱 시작 시 한 번 읽음 | 11/29 규칙 CRUD 구현 때 |
 
 ## SQLD 연결
@@ -128,6 +250,8 @@ WHERE r.enabled = 1;
 | JOIN | `load_rules()`를 JOIN으로 바꿔보기 | [[2026-11-09]] |
 
 ## 전체 스키마 (cat_app.py 원본)
+
+아래는 v0 테이블 정의(`SCHEMA`)다. v1 컬럼은 위 마이그레이션 표와 `cat_app.py`의 `MIGRATIONS` 참고.
 
 ```sql
 PRAGMA foreign_keys = ON;
