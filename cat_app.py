@@ -1349,17 +1349,16 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
             holder["cat"].act("angry", 2)
             ctl.last = f"😾 간식이 없잖아! 딴짓 안 하고 {fmt_time(ctl.timing.snack_every)} 버티면 생겨"
 
-    def set_mode(action: str) -> None:
+    def set_mode(action: str, test: bool = False) -> None:
+        """👀 감시 / 💼 업무 / 🧪 테스트(= 업무모드 + 모든 간격 초 단위). 감시·업무를 고르면 평소 시간으로."""
+        ctl.timing = TEST_TIMING if test else Timing()
         mode.set(action)
         switch()
-
-    def toggle_test() -> None:
-        ctl.timing = Timing() if ctl.timing.step else TEST_TIMING
-        tm = ctl.timing
-        ctl.last = (f"🧪 테스트 모드 켬: 딴짓 {fmt_time(tm.step)} · 간식 {fmt_time(tm.snack_every)}"
-                    f" · 눈 쉬기 {fmt_time(tm.eye_every)} · 어디야 {fmt_time(tm.checkin)}"
-                    if tm.step else "🧪 테스트 모드 끔: 평소 시간 (딴짓 5분)")
-        print(f"=== {ctl.last} ===")
+        if test:
+            tm = ctl.timing
+            ctl.last = (f"🧪 테스트 모드: 딴짓 {fmt_time(tm.step)} · 간식 {fmt_time(tm.snack_every)}"
+                        f" · 눈 쉬기 {fmt_time(tm.eye_every)} · 어디야 {fmt_time(tm.checkin)}")
+            print(f"=== {ctl.last} ===")
 
     def toggle_eye() -> None:
         eye_var.set(not eye_var.get())
@@ -1373,10 +1372,10 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
     holder["cat"] = DesktopCat(root, pet=pet, feed=feed, menu=[
         ("👀 감시 모드", lambda: set_mode("log")),
         ("💼 업무모드", lambda: set_mode("close")),
+        ("🧪 테스트 모드 (업무모드를 초 단위로)", lambda: set_mode("close", test=True)),
         None,
         ("🐟 간식 주기", feed),
         ("👀 눈 쉬기 켜기/끄기", toggle_eye),
-        ("🧪 테스트 모드 켜기/끄기 (초 단위)", toggle_test),
         None,
         ("📊 오늘 한 일", show_today),
         ("🧠 배운 것", show_learned),
