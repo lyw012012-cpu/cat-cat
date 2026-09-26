@@ -480,6 +480,15 @@ class TestTestMode(unittest.TestCase):
         run(db, RecordingProbe([FUN] * 3), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
         self.assertEqual(db.execute("SELECT COUNT(*) FROM block_event").fetchone()[0], 0)   # 30초로는 5분에 못 미침
 
+    def test_test_mode_can_be_switched_on_while_running(self):
+        """▶로 평소대로 켠 뒤 고양이 메뉴에서 테스트 모드를 켜면 그 자리에서 10초 간격이 된다."""
+        db = connect(":memory:")
+        ctl = Control("close")
+        switch_on = lambda left: setattr(ctl, "timing", cat_app.TEST_TIMING) if left == 3 else None
+        run(db, RecordingProbe([FUN] * 5, on_frame=switch_on), 10.0, ctl, True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
+                         [(40, "warn"), (50, "mute")])   # 켠 다음 확인부터 10초 간격, 그 전엔 5분 기준이라 조용
+
     def test_test_mode_speeds_up_everything(self):
         """테스트 모드면 간식(20초)·눈 쉬기(30초)·어디야(40초)·배고픔(1분)도 초 단위."""
         db = connect(":memory:")
