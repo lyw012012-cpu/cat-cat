@@ -1,0 +1,11 @@
+# 사용 기록 (개인정보) — 절대 올리지 않음
+*.db
+*.db-journal
+spike_log.jsonl
+*.jsonl
+
+# 개인 공부 노트
+코딩공부/
+
+__pycache__/
+.vscode/
