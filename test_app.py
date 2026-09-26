@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 import cat_app
@@ -14,7 +15,8 @@ from cat_app import (Control, block, connect, load_rules, run, save_session,
                      single_instance, top_apps_today)
 from watch import Session, WindowInfo, now_iso, pick_rule
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # 앱처럼 cp949 콘솔에서 이모지 출력 허용
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # 앱처럼 cp949 콘솔에서 이모지 출력 허용
 
 SHORTS = WindowInfo("웃긴영상 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/shorts/x")
 NORMAL = WindowInfo("강의 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/watch?v=a")   # 공부 → 제외
@@ -474,6 +476,19 @@ class TestSingleInstance(unittest.TestCase):
         name = f"Local\\jipsa-cat-test-{os.getpid()}"
         self.assertTrue(single_instance(name))
         self.assertFalse(single_instance(name))
+
+
+class TestWatchThreadDoesNotDieSilently(unittest.TestCase):
+    """DB 연결 실패가 감시 스레드를 조용히 죽이면 안 된다 — GUI는 계속 떠 있는데 아무 기록도 안 남는 버그였다."""
+
+    def test_connect_failure_is_logged_and_stops(self):
+        ctl = Control("log")
+        boom = RuntimeError("디스크 꽉 참")
+        with unittest.mock.patch.object(cat_app, "connect", side_effect=boom):
+            cat_app.watch_in_background(":memory:", 0.0, ctl)   # WindowsProbe()까지 못 감 (connect가 먼저 터짐)
+        self.assertIn("RuntimeError", ctl.last)
+        self.assertIn("디스크 꽉 참", ctl.last)
+        self.assertTrue(ctl.stop.is_set())
 
 
 if __name__ == "__main__":

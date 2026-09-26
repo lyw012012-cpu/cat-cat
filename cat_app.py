@@ -717,6 +717,8 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
 
         def answer(choice: str) -> None:
             if choice == "remember":
+                if ctl.task_id is None:
+                    return
                 add_allow(uidb, ctl.task_id, kind, value, learned=True)
                 ctl.allow_items = load_allow(uidb, ctl.task_id)
                 remember(uidb, "training", f"{value}도 공부·업무라고 배움")
@@ -1015,20 +1017,23 @@ def watch_in_background(db_path: str, interval: float, ctl: Control) -> None:
     except ImportError:
         uia_ready = contextlib.nullcontext()
     with uia_ready:
-        db = connect(db_path)
+        db = None
         try:
+            db = connect(db_path)
             run(db, WindowsProbe(), interval, ctl, stop_when_empty=False)
         except Exception as e:                           # noqa: BLE001
             ctl.last = f"⚠ 오류로 멈춤: {type(e).__name__}: {e}"
             print(ctl.last)
             ctl.stop.set()
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
 
 def main() -> int:
     # 한국어 Windows 콘솔(cp949)에서 이모지·특수문자 출력으로 죽지 않게
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 
     ap = argparse.ArgumentParser(description="집사 고양이 v0.1")
     ap.add_argument("--simulate", action="store_true", help="가짜 시나리오 + 메모리 DB")
