@@ -463,6 +463,36 @@ class TestEyeAndMood(unittest.TestCase):
                          [(5, "warn"), (10, "mute")])
 
 
+class TestTestMode(unittest.TestCase):
+    """🧪 --test: DB 설정(5분)은 그대로 두고 이번 실행만 딴짓 단계를 10초로."""
+
+    def test_test_mode_uses_10_second_steps(self):
+        db = connect(":memory:")                                            # 기본 DB: 5분 간격
+        ctl = Control("close")
+        ctl.timing = cat_app.TEST_TIMING
+        run(db, RecordingProbe([FUN] * 3), 10.0, ctl, True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
+                         [(10, "warn"), (20, "mute"), (30, "delay")])
+        self.assertEqual(db.execute("SELECT step_sec FROM block_rule WHERE rule_id = 'r_yt_warn'").fetchone(), (300,))
+
+    def test_normal_mode_keeps_5_minutes(self):
+        db = connect(":memory:")
+        run(db, RecordingProbe([FUN] * 3), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM block_event").fetchone()[0], 0)   # 30초로는 5분에 못 미침
+
+    def test_test_mode_speeds_up_everything(self):
+        """테스트 모드면 간식(20초)·눈 쉬기(30초)·어디야(40초)·배고픔(1분)도 초 단위."""
+        db = connect(":memory:")
+        ctl = Control("close")
+        ctl.timing = cat_app.TEST_TIMING
+        run(db, RecordingProbe([WindowInfo("main.py", "Code.exe")] * 7), 10.0, ctl, True)   # 70초
+        reqs = [ctl.ui_requests.get_nowait() for _ in range(ctl.ui_requests.qsize())]
+        self.assertEqual(reqs.count(("eye",)), 2)                         # 30초, 60초
+        self.assertIn(("checkin",), reqs)                                 # 40초
+        self.assertEqual(cat_app.snack_count(db), 2 + 2)                  # 20·40초 간식 — 40초 '어디야?'에 15초 무응답이면 자리 비움이라 60초엔 없음
+        self.assertEqual(cat_app.get_fullness(db), 1)                     # 60초에 배고파짐
+
+
 class TestSnacks(unittest.TestCase):
     """🐟 딴짓 안 하면 간식이 생기고, 딴짓하면 없어지고, 먹이면 기분이 좋아진다."""
 
