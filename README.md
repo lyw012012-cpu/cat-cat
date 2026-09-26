@@ -77,8 +77,8 @@ python cat_app.py --report        # 오늘 가장 많이 쓴 앱 TOP 5
 
 ## 테스트
 ```powershell
-python test_rules.py   # 규칙 판정 (AND/OR 그룹, 우선순위)
-python test_app.py     # SQLite 저장/조회
+python tests/test_rules.py   # 규칙 판정 (AND/OR 그룹, 우선순위)
+python tests/test_app.py     # SQLite 저장/조회
 ```
 
 ## 구조

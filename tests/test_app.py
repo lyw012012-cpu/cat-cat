@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cat_app DB 계층 테스트 — python test_app.py (Windows 없이 동작)"""
+"""cat_app DB 계층 테스트 — python tests/test_app.py (Windows 없이 동작)"""
 
 import os
 import sqlite3
@@ -8,6 +8,8 @@ import tempfile
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))   # 상위 폴더의 cat_app·watch를 찾도록
 
 import cat_app
 
