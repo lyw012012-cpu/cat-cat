@@ -34,14 +34,14 @@ def fast_db() -> sqlite3.Connection:
 
 class RecordingProbe:
     """행동을 실제로 하지 않고 무엇을 했는지만 적어 두는 가짜 프로브."""
-    def __init__(self, frames, on_frame=None):
-        self.frames, self.on_frame, self.calls = list(frames), on_frame, []
+    def __init__(self, frames, on_frame=None, idle=0.0):
+        self.frames, self.on_frame, self.calls, self.idle = list(frames), on_frame, [], idle
     def probe(self):
         if self.on_frame:
             self.on_frame(len(self.frames))
         return self.frames.pop(0) if self.frames else None
     def idle_seconds(self):
-        return 0.0
+        return self.idle
     def close_tab(self, hwnd):
         self.calls.append("close"); return True
     def mute_app(self, exe, mute):
@@ -398,6 +398,76 @@ class TestV9(unittest.TestCase):
         self.assertTrue(cat_app.sites_need_refresh(db))
 
 
+class TestEyeAndMood(unittest.TestCase):
+    """👀 20-20-20 눈 쉬기 · 😺 고양이 기분별 딴짓 차단 시간."""
+
+    CODE = WindowInfo("main.py - VS Code", "Code.exe")
+
+    def requests(self, ctl):
+        out = []
+        while not ctl.ui_requests.empty():
+            out.append(ctl.ui_requests.get_nowait())
+        return out
+
+    def test_eye_rest_every_20_minutes_in_any_mode(self):
+        for mode in ("log", "close"):
+            ctl = Control(mode)
+            run(connect(":memory:"), RecordingProbe([self.CODE] * 250), 10.0, ctl, True)   # 41분 40초
+            self.assertEqual(self.requests(ctl).count(("eye",)), 2, mode)
+
+    def test_eye_timer_resets_when_away(self):
+        """20초 넘게 입력이 없으면(화면을 안 보면) 이미 쉰 것 → 20분을 다시 센다."""
+        ctl = Control("log")
+        run(connect(":memory:"), RecordingProbe([self.CODE] * 150, idle=30), 10.0, ctl, True)
+        self.assertNotIn(("eye",), self.requests(ctl))
+
+    def test_eye_rest_can_be_turned_off(self):
+        ctl = Control("log")
+        ctl.eye_on = False
+        run(connect(":memory:"), RecordingProbe([self.CODE] * 150), 10.0, ctl, True)
+        self.assertNotIn(("eye",), self.requests(ctl))
+
+    def test_eye_rest_scored(self):
+        db = connect(":memory:")
+        t = days_ago(1)
+        db.execute("INSERT INTO usage_session (started_at, exe, duration_sec, is_idle, verdict) VALUES (?, 'Code.exe', 600, 0, 'focus')", (t,))
+        db.executemany("INSERT INTO eye_rest (started_at, completed) VALUES (?, ?)", [(t, 1), (t, 1), (t, 0)])
+        db.commit()
+        cat_app.summarize_and_prune(db)
+        self.assertIn(("stick", "눈 쉬기 1번 건너뜀", -1),
+                      db.execute("SELECT kind, reason, points FROM cat_memory").fetchall())
+
+    def set_score(self, db, points):
+        db.execute("INSERT INTO cat_memory (day, kind, reason, points, created_at) VALUES (?, 'carrot', 't', ?, ?)",
+                   (days_ago(1)[:10], points, now_iso()))
+        db.commit()
+
+    def test_mood_from_latest_score(self):
+        db = connect(":memory:")
+        self.assertEqual(cat_app.cat_mood(db)[:3], ("🐱", "보통", 1.0))          # 점수 없음
+        self.set_score(db, 12)
+        self.assertEqual(cat_app.cat_mood(db), ("😺", "기분 좋음", 2.0, 12))
+        db.execute("UPDATE cat_memory SET points = -6")
+        self.assertEqual(cat_app.cat_mood(db)[:3], ("😾", "화남", 0.5))
+
+    def test_happy_cat_extends_block_time(self):
+        """기분 좋으면 딴짓 단계 간격이 2배 (테스트 DB 10초 → 20초)."""
+        db = fast_db()
+        self.set_score(db, 12)
+        ctl = Control("close")
+        run(db, RecordingProbe([FUN] * 4), 10.0, ctl, True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
+                         [(20, "warn"), (40, "mute")])
+        self.assertEqual(ctl.mood[:2], ("😺", "기분 좋음"))
+
+    def test_angry_cat_shortens_block_time(self):
+        db = fast_db()
+        self.set_score(db, -8)
+        run(db, RecordingProbe([FUN] * 2), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
+                         [(10, "warn"), (20, "mute")])    # 5초 간격이라 10초마다 확인해도 한 번에 한 칸씩만
+
+
 class TestTimedRule(unittest.TestCase):
     """딴짓 영상은 오늘 누적 10초 구간마다 한 번 반응한다 (강의·노래 시간은 안 셈)."""
 
@@ -461,7 +531,7 @@ class TestSessionsAndMigration(unittest.TestCase):
         self.assertEqual(db.execute("SELECT subject, operator, value FROM rule_condition WHERE rule_id = 'r_yt_warn'")
                          .fetchall(), [("verdict", "eq", "distract")])     # v8: 딴짓 판정이면 무엇이든
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        self.assertTrue({"focus_checkin", "video_info", "site_kind", "cat_memory"} <= tables)   # v5·v6·v8 (v9에서 focus_task·allow_item 제거)
+        self.assertTrue({"focus_checkin", "video_info", "site_kind", "cat_memory", "eye_rest"} <= tables)   # v5·v6·v8 (v9에서 focus_task·allow_item 제거)
         self.assertIn("site_kind", {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")})
         db.close()
         connect(path).close()                                  # 두 번 열어도 다시 적용되지 않음
@@ -547,6 +617,7 @@ class TestFocus(unittest.TestCase):
         """할 일을 고르지 않아도: 모르는 사이트 30초 → 묻기, 공부 앱 20분 → 어디야?, 무응답 3분 → 자리 비움."""
         db = connect(":memory:")
         ctl = Control("close")                                  # 할 일 없이 업무모드
+        ctl.eye_on = False
         so = WindowInfo("질문 - 어떤 블로그", "chrome.exe", "someblog.net/q/1")
         code = WindowInfo("main.py - VS Code", "Code.exe")
         # 10초 간격: 모르는 창 30초 → 허용된 창 20분 → 대답 없이 3분 넘게 더
@@ -563,6 +634,7 @@ class TestFocus(unittest.TestCase):
     def test_watch_mode_never_asks(self):
         db = connect(":memory:")
         ctl = Control("log")
+        ctl.eye_on = False                                     # 눈 쉬기는 따로 확인
         frames = [WindowInfo("질문", "chrome.exe", "stackoverflow.com/q/1")] * 10 \
             + [WindowInfo("main.py", "Code.exe")] * 130
         run(db, RecordingProbe(frames), 10.0, ctl, True)

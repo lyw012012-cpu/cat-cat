@@ -276,6 +276,15 @@ MIGRATIONS = [
     DROP TABLE allow_item;
     DROP TABLE focus_task;
     """,
+    # v10: 👀 20-20-20 눈 쉬기 기록 (20분마다 20초 동안 6미터 먼 곳 보기)
+    """
+    CREATE TABLE eye_rest (
+        rest_id    INTEGER PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        completed  INTEGER CHECK (completed IN (0, 1))   -- 1 = 20초 다 쉼, 0 = Esc로 건너뜀, NULL = 도중에 앱 종료
+    );
+    CREATE INDEX ix_eye_started ON eye_rest(started_at);
+    """,
 ]
 
 BACKUPS_KEPT = 2        # 업그레이드 전 자동 백업을 최근 몇 개까지 남길지
@@ -321,6 +330,7 @@ def score_day(db: sqlite3.Connection, day: str) -> list[tuple[str, str, int]]:
     끝난 하루(daily_summary 로 요약된 날)의 채찍·당근. [(kind, 이유, 점수)].
       🥕 집중 30분 이상 +5, 평소보다 많이 집중 +5, 숏폼 0회 +3, "어디야?" 모두 대답 +2
       🪓 딴짓 30분 이상 -5, 평소보다 딴짓 20% 넘게 많음 -5, 숏폼 1회당 -2(최대 -10), "어디야?" 무응답 1회당 -1
+      👀 눈 쉬기를 모두 지키면 +2, 건너뛴 만큼 -1(최대 -3)
       🧠 평소 기준(최근 7일 평균)을 기록
     """
     focus, distract, shorts = db.execute(
@@ -351,6 +361,12 @@ def score_day(db: sqlite3.Connection, day: str) -> list[tuple[str, str, int]]:
         out.append(("stick", f"숏폼 {shorts}회", -min(2 * shorts, 10)))
     if missed:
         out.append(("stick", f"'어디야?' {missed}번 무응답", -missed))
+    rests, rested = db.execute("SELECT COUNT(*), COALESCE(SUM(completed = 1), 0) FROM eye_rest"
+                               " WHERE date(started_at, 'localtime') = ?", (day,)).fetchone()
+    if rests and rested == rests:
+        out.append(("carrot", f"눈 쉬기 {rests}번 모두 지킴", 2))
+    elif rests:
+        out.append(("stick", f"눈 쉬기 {rests - rested}번 건너뜀", -min(rests - rested, 3)))
     if base[2]:
         out.append(("training", f"평소(최근 {base[2]}일 평균): 집중 {base[0]:.0f}분 · 딴짓 {base[1]:.0f}분", 0))
     return out
@@ -392,6 +408,7 @@ def summarize_and_prune(db: sqlite3.Connection, keep_days: int = RETENTION_DAYS)
                    " AND date(started_at, 'localtime') IN (SELECT day FROM daily_summary)", (cutoff,))
         db.execute("DELETE FROM block_event WHERE date(occurred_at, 'localtime') < date('now', 'localtime', ?)"
                    " AND date(occurred_at, 'localtime') IN (SELECT day FROM daily_summary)", (cutoff,))
+        db.execute("DELETE FROM eye_rest WHERE date(started_at, 'localtime') < date('now', 'localtime', ?)", (cutoff,))
 
 
 def backup_before_upgrade(db: sqlite3.Connection, path: str, version: int) -> None:
@@ -543,6 +560,8 @@ def forget(db: sqlite3.Connection, what: str, key: str) -> None:
 ASK_UNKNOWN_SEC = 30          # 업무모드에서 모르는 창이 이만큼 앞에 있으면 "이것도 공부야?" 묻기
 CHECKIN_SEC = 20 * 60         # 공부로 판정된 창에 이만큼 있으면 "어디야?" 확인
 CHECKIN_TIMEOUT_SEC = 3 * 60  # 확인에 이만큼 대답이 없으면 그때부터 자리 비움
+EYE_EVERY_SEC = 20 * 60       # 👀 20-20-20: 화면을 20분 보면
+EYE_REST_SEC = 20             #    20초 동안 6미터(20피트) 먼 곳을 본다. 20초 넘게 자리를 비웠으면 이미 쉰 것
 
 
 def _bare_host(url: str | None) -> str:
@@ -792,6 +811,28 @@ def checkins_text(db: sqlite3.Connection) -> str:
     return "🐱 어디야?\n" + "\n".join(f"    {t}  {label[a]}" + (f" — {n}" if n else "") for t, a, n in rows)
 
 
+# 😺 고양이 기분 = 최근 점수를 매긴 날의 합계. 기분에 따라 딴짓 단계 간격을 늘이거나 줄인다.
+MOODS = ((10, "😺", "기분 좋음", 2.0),       # +10 이상: 딴짓 영상 차단 시간 2배로 확장 (보상)
+         (-4, "🐱", "보통", 1.0),
+         (None, "😾", "화남", 0.5))          # -5 이하: 절반으로
+
+
+def cat_mood(db: sqlite3.Connection) -> tuple[str, str, float, int | None]:
+    """(얼굴, 이름, 딴짓 간격 배수, 점수). 아직 점수가 없으면 보통."""
+    day = db.execute("SELECT MAX(day) FROM cat_memory WHERE kind IN ('carrot', 'stick')").fetchone()[0]
+    if not day:
+        return "🐱", "보통", 1.0, None
+    score = db.execute("SELECT SUM(points) FROM cat_memory WHERE day = ?", (day,)).fetchone()[0]
+    face, name, mult = next((f, n, m) for t, f, n, m in MOODS if t is None or score >= t)
+    return face, name, mult, score
+
+
+def eye_text(db: sqlite3.Connection) -> str:
+    rests, rested = db.execute("SELECT COUNT(*), COALESCE(SUM(completed = 1), 0) FROM eye_rest"
+                               " WHERE date(started_at, 'localtime') = date('now', 'localtime')").fetchone()
+    return f"👀 눈 쉬기 오늘 {rests}번" + (f" (다 쉼 {rested}, 건너뜀 {rests - rested})" if rests else "")
+
+
 def score_text(db: sqlite3.Connection) -> str:
     """가장 최근에 점수를 매긴 날의 채찍·당근."""
     day = db.execute("SELECT MAX(day) FROM cat_memory WHERE kind IN ('carrot', 'stick')").fetchone()[0]
@@ -805,7 +846,7 @@ def score_text(db: sqlite3.Connection) -> str:
 
 
 def today_text(db: sqlite3.Connection) -> str:
-    return "\n\n".join((breakdown_text(db), checkins_text(db), score_text(db)))
+    return "\n\n".join((breakdown_text(db), checkins_text(db), eye_text(db), score_text(db)))
 
 
 def print_report(db: sqlite3.Connection, since: str | None = None) -> None:
@@ -870,6 +911,8 @@ class Control:
         self.muted_exe: str | None = None    # 고양이가 소리를 끈 앱 (벗어나면 다시 켠다)
         self.site_kinds: dict = {}           # 사이트·앱 → (판정, 출처). 창에서 배우면 바로 여기에 더한다
         self.sites_changed = False           # 공개 목록을 새로 받았으니 다시 읽으라는 신호
+        self.eye_on = True                   # 👀 20-20-20 눈 쉬기 (고양이 창에서 끄고 켠다)
+        self.mood = ("🐱", "보통", 1.0, None)  # 😺 고양이 기분 (루프가 시작할 때 정한다)
         self.decided: dict = {}              # "이번만" / "아니, 딴짓" 대답 (이번 실행 동안만)
         self.ui_requests: queue.Queue = queue.Queue()   # 루프 → 창: ("unknown", key, 제목) / ("checkin",)
         self.video_labels: dict = {}         # 영상 ID → (YouTube 카테고리, 사용자 대답)
@@ -1074,6 +1117,11 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
     row.pack()
     tk.Button(row, text="📊 오늘 한 일", font=(FONT, 9), command=show_today).pack(side="left", padx=2)
     tk.Button(row, text="🧠 배운 것", font=(FONT, 9), command=show_learned).pack(side="left", padx=2)
+    mood_label = tk.Label(root, font=(FONT, 9), pady=2)
+    mood_label.pack()
+    eye_var = tk.BooleanVar(value=ctl.eye_on)
+    tk.Checkbutton(root, text="👀 20분마다 눈 쉬기 (20초)", variable=eye_var, font=(FONT, 9),
+                   command=lambda: setattr(ctl, "eye_on", eye_var.get())).pack()
     status = tk.Label(root, fg="#555", wraplength=260, pady=10, font=("맑은 고딕", 9))
     status.pack()
     tk.Label(root, text="창을 닫으면 고양이도 쉽니다", fg="#999", font=("맑은 고딕", 8)).pack(pady=(0, 8))
@@ -1096,8 +1144,47 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
             cover.after(1000, count, n - 1)
         count(seconds)
 
+    def show_eye_rest() -> None:
+        """👀 20-20-20: 화면을 까맣게 덮고 고양이가 '6미터 먼 곳을 20초 바라봐' 안내. Esc로 건너뛸 수 있다."""
+        with uidb:
+            rid = uidb.execute("INSERT INTO eye_rest (started_at) VALUES (?)", (now_iso(),)).lastrowid
+        cover = tk.Toplevel(root)
+        cover.attributes("-fullscreen", True)
+        cover.attributes("-topmost", True)
+        cover.configure(bg="black")
+        tk.Label(cover, text="🐱", font=(FONT, 90), bg="black").pack(expand=True, anchor="s")
+        text = tk.Label(cover, fg="white", bg="black", font=(FONT, 26, "bold"), justify="center")
+        text.pack(expand=True, anchor="n")
+        tk.Label(cover, text="Esc: 건너뛰기", fg="#666", bg="black", font=(FONT, 10)).pack(pady=20)
+        state = {"over": False}
+
+        def finish(rested: bool) -> None:
+            if state["over"]:
+                return
+            state["over"] = True
+            with uidb:
+                uidb.execute("UPDATE eye_rest SET completed = ? WHERE rest_id = ?", (int(rested), rid))
+            ctl.last = "👀 잘했어! 눈이 좀 쉬었지?" if rested else "👀 다음엔 꼭 쉬자"
+            cover.destroy()
+
+        def count(n: int) -> None:
+            if state["over"]:
+                return
+            if n <= 0:
+                finish(True)
+                return
+            text.config(text=f"눈 쉬는 시간!\n\n창밖 6미터 먼 곳을 바라봐\n\n{n}")
+            cover.after(1000, count, n - 1)
+
+        cover.bind("<Escape>", lambda _: finish(False))
+        cover.focus_force()
+        count(EYE_REST_SEC)
+
     def tick() -> None:                      # 작업 스레드 소식을 0.5초마다 창에 반영
         status.config(text=ctl.last)
+        face, name, mult, score = ctl.mood
+        mood_label.config(text=f"{face} 기분: {name}" + (f" (최근 {score:+d}점)" if score is not None else "")
+                          + ("" if mult == 1 else f" · 딴짓 간격 ×{mult:g}"))
         while not ctl.ui_requests.empty():
             req = ctl.ui_requests.get_nowait()
             if req[0] == "unknown":
@@ -1106,6 +1193,8 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
                 ask_video(req[1], req[2])
             elif req[0] == "checkin":
                 ask_checkin()
+            elif req[0] == "eye":
+                show_eye_rest()
         if ctl.delay_request:
             seconds, ctl.delay_request = ctl.delay_request, 0
             show_delay(seconds)
@@ -1182,7 +1271,15 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                 threading.Thread(target=lambda: ctl.fetched.put((vid, fetch(vid))), daemon=True).start()
         return video_kind(category, user_label, title or w.title, ctl.action)
     instant = [r for r in rules if r.step_sec == 0]         # 창을 열자마자 판정
-    timed = [r for r in rules if r.step_sec > 0]            # 오늘 누적 N초마다 판정
+    # 😺 고양이 기분만큼 딴짓 단계 간격을 늘이거나 줄인다 (기분 좋음 5분 → 10분, 화남 → 2분 30초)
+    ctl.mood = cat_mood(db)
+    face, mood_name, mult, _ = ctl.mood
+    timed = [replace(r, step_sec=max(1, int(r.step_sec * mult))) for r in rules if r.step_sec > 0]
+    if mult != 1 and timed:
+        gap = fmt_time(timed[0].step_sec)
+        ctl.last = (f"{face} 고양이 {mood_name}! 오늘은 딴짓 {gap}마다 봐줄게" if mult > 1
+                    else f"{face} 고양이 {mood_name}... 오늘은 딴짓 {gap}마다 혼낼 거야")
+    eye_timer = 0.0                       # 👀 마지막으로 눈을 쉰 뒤 화면을 본 시간
     # ponytail: 같은 구간에서 두 번 말하지 않게 메모리에만 기억. 하루에 앱을 다시 켜면 현재 구간을 한 번 더 말한다.
     fired: set[tuple] = set()
     streak = 0.0                          # 마지막 "어디야?" 이후 허용된 창에 있은 시간
@@ -1211,6 +1308,14 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                 if not stop_when_empty:
                     ctl.stop.wait(interval)
                 continue
+            if ctl.eye_on and win is not None:              # 👀 20-20-20 (모드와 상관없이)
+                if probe.idle_seconds() >= EYE_REST_SEC:    # 20초 넘게 화면을 안 봤으면 이미 쉰 것
+                    eye_timer = 0.0
+                else:
+                    eye_timer += elapsed
+                    if eye_timer >= EYE_EVERY_SEC:
+                        eye_timer = 0.0
+                        ctl.ui_requests.put(("eye",))
             take_fetched()                                  # 뒤에서 가져온 카테고리 반영
             if win is not None:
                 win = replace(win, video_kind=kind_of(win))
