@@ -1,4 +1,4 @@
-> 고양이 앱 DB는 테이블 10개 (스키마 v10). 정리된 ERD는 위키 [[고양이-앱-db-erd]]. 이 문서는 설계 이유와 변경 이력. **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
+> 고양이 앱 DB는 테이블 12개 (스키마 v11). 정리된 ERD는 위키 [[고양이-앱-db-erd]]. 이 문서는 설계 이유와 변경 이력. **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
 
 - 코드: `cat_app.py`의 `SCHEMA` · DB 파일: `%LOCALAPPDATA%\cat-app\cat.db` (개인정보라 OneDrive·git 밖 PC 로컬에 둠)
 - 관련: [[진행도]] · [[고양이-생산성-앱-프로젝트]] · [[프로젝트 일정]]
@@ -96,6 +96,17 @@ erDiagram
         TEXT started_at "인덱스"
         INTEGER completed "1=다 쉼, 0=건너뜀"
     }
+    snack_log {
+        INTEGER snack_id PK
+        TEXT at
+        INTEGER delta "+1 벌기, -1 잃기·먹이기"
+        TEXT kind "earn/lose/feed/bonus"
+        TEXT reason
+    }
+    cat_state {
+        TEXT key PK "fullness"
+        TEXT value "포만감 0~5"
+    }
     cat_memory {
         INTEGER memory_id PK
         TEXT day
@@ -159,6 +170,7 @@ erDiagram
 | 버전 | 내용 |
 |---|---|
 | v0 | 테이블 4개 (최초) |
+| v11 (2026-09-27) | `snack_log`, `cat_state` 추가 · 기분을 포만감 기준으로 · 움직이는 고양이 |
 | v10 (2026-09-27) | `eye_rest` 추가 (20-20-20 눈 쉬기 기록) · 고양이 기분별 딴짓 간격(코드) · 백업 자동 회전 확인 (`v8`, `v9`) |
 | v9 (2026-09-27) | 정리: 딴짓 단계 10초(테스트 값) → **5분** · `focus_task`·`allow_item` 삭제 · `usage_session`·`focus_checkin`에서 `task_id` 제거(FK라 재생성) · `min_minutes`·`block_event.minutes` DROP · `video_info.title` 추가 · `focus_checkin` 인덱스 · **업그레이드 전 자동 백업**(최근 2개) · 채찍·당근 점수(`score_day`) · UT1 30일마다 갱신 |
 | v8 (2026-09-27) | `site_kind` 추가(내 대답 + UT1 공개 목록) · 딴짓 규칙을 `verdict = 'distract'`로 일반화 · `rule_condition.subject`에 `verdict` · 백업 `cat.backup-v7.db` |
@@ -185,6 +197,12 @@ erDiagram
 `url_host`에 NULL 대신 `''`를 쓰는 이유: 기본키(PK) 컬럼은 NULL이면 중복 판정이 안 된다.
 
 **훈련 기억 아이디어:** `daily_summary`로 최근 7일 평균 유튜브 분을 계산 → 오늘이 평균보다 적으면 🥕, 많으면 🪓 → 결과를 `cat_memory`에 남김. (점수 규칙은 추후 결정)
+
+## 간식과 포만감 (v11)
+- `snack_log` — 간식 변화 기록, **간식 수 = SUM(delta)**. earn(딴짓 없이 20분) · lose(딴짓 반응마다, 0 밑으로 안 감) · feed(먹이기) · bonus(첫 만남 2개, 점수 +10 이상인 날 5점마다 1개·최대 3)
+- `cat_state('fullness')` — 포만감 0~5. 먹이면 +1, 앱이 켜져 있는 1시간마다 -1
+- **기분 = 포만감** (v10의 '전날 점수' 기분을 대체): 3~5 😺 ×2 · 1~2 🐱 ×1 · 0 😾 ×0.5. 딴짓 단계를 판정할 때마다 그 순간 기분으로 간격을 계산 → 간식을 먹이면 바로 적용. 단계 기억 키는 '구간 번호'가 아니라 '구간 경계 초'라서 간격이 바뀌어도 한 번에 한 칸씩
+- 움직이는 고양이(`cat_sprite.py`)는 DB가 아니라 화면 쪽: 루프가 `ctl.anims`에 (자세, 초)를 넣으면 고양이가 그 동작을 한다
 
 ## 눈 쉬기와 고양이 기분 (v10)
 - **👀 20-20-20** — 루프가 화면을 본 시간을 세다가 20분이 되면 창에 눈 쉬기를 요청. 입력이 20초 넘게 없으면 이미 쉰 것으로 보고 0부터. 창이 `eye_rest`에 시작을 기록하고, 20초를 다 채우면 `completed = 1`, Esc면 0. 원본처럼 90일 보관. 점수: 모두 지키면 🥕+2, 건너뛴 만큼 🪓-1(최대 -3)

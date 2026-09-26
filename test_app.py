@@ -178,7 +178,7 @@ class TestTalkAndCounts(unittest.TestCase):
     def test_message_has_no_process_labels(self):
         ctl = Control("close")
         run(connect(":memory:"), RecordingProbe([SHORTS]), 0.0, ctl, True)
-        self.assertEqual(ctl.last, "🐱 또 쇼츠야? 꺼 버렸어. 업무 중엔 쇼츠 금지야.")
+        self.assertEqual(ctl.last, "🐱 또 쇼츠야? 꺼 버렸어. 업무 중엔 쇼츠 금지야. 간식 -1 (남은 1개)")
 
     def test_today_breakdown_lists_what_was_done(self):
         db = connect(":memory:")
@@ -437,35 +437,87 @@ class TestEyeAndMood(unittest.TestCase):
         self.assertIn(("stick", "눈 쉬기 1번 건너뜀", -1),
                       db.execute("SELECT kind, reason, points FROM cat_memory").fetchall())
 
-    def set_score(self, db, points):
-        db.execute("INSERT INTO cat_memory (day, kind, reason, points, created_at) VALUES (?, 'carrot', 't', ?, ?)",
-                   (days_ago(1)[:10], points, now_iso()))
-        db.commit()
-
-    def test_mood_from_latest_score(self):
+    def test_mood_from_fullness(self):
         db = connect(":memory:")
-        self.assertEqual(cat_app.cat_mood(db)[:3], ("🐱", "보통", 1.0))          # 점수 없음
-        self.set_score(db, 12)
-        self.assertEqual(cat_app.cat_mood(db), ("😺", "기분 좋음", 2.0, 12))
-        db.execute("UPDATE cat_memory SET points = -6")
+        self.assertEqual(cat_app.cat_mood(db), ("🐱", "보통", 1.0, 2, 2))          # 처음: 포만감 2, 간식 2
+        cat_app.set_fullness(db, 4)
+        self.assertEqual(cat_app.cat_mood(db)[:3], ("😺", "기분 좋음", 2.0))
+        cat_app.set_fullness(db, 0)
         self.assertEqual(cat_app.cat_mood(db)[:3], ("😾", "화남", 0.5))
 
     def test_happy_cat_extends_block_time(self):
-        """기분 좋으면 딴짓 단계 간격이 2배 (테스트 DB 10초 → 20초)."""
+        """간식을 먹어 기분 좋으면 딴짓 단계 간격 2배 (테스트 DB 10초 → 20초)."""
         db = fast_db()
-        self.set_score(db, 12)
+        cat_app.set_fullness(db, 4)
         ctl = Control("close")
         run(db, RecordingProbe([FUN] * 4), 10.0, ctl, True, fetch=lambda vid: "Comedy")
         self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
                          [(20, "warn"), (40, "mute")])
-        self.assertEqual(ctl.mood[:2], ("😺", "기분 좋음"))
 
-    def test_angry_cat_shortens_block_time(self):
+    def test_hungry_cat_shortens_block_time(self):
+        """포만감 0(화남)이면 간격 절반 (10초 → 5초)."""
         db = fast_db()
-        self.set_score(db, -8)
-        run(db, RecordingProbe([FUN] * 2), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
+        cat_app.set_fullness(db, 0)
+        run(db, RecordingProbe([FUN] * 2), 5.0, Control("close"), True, fetch=lambda vid: "Comedy")
         self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
-                         [(10, "warn"), (20, "mute")])    # 5초 간격이라 10초마다 확인해도 한 번에 한 칸씩만
+                         [(5, "warn"), (10, "mute")])
+
+
+class TestSnacks(unittest.TestCase):
+    """🐟 딴짓 안 하면 간식이 생기고, 딴짓하면 없어지고, 먹이면 기분이 좋아진다."""
+
+    CODE = WindowInfo("main.py - VS Code", "Code.exe")
+    NETFLIX = WindowInfo("넷플릭스", "chrome.exe", "netflix.com/browse")
+
+    def quiet(self, mode="log"):
+        ctl = Control(mode)
+        ctl.eye_on = False
+        return ctl
+
+    def test_earn_after_20_minutes_without_distraction(self):
+        db = connect(":memory:")
+        ctl = self.quiet()
+        run(db, RecordingProbe([self.CODE] * 121), 10.0, ctl, True)
+        self.assertEqual(cat_app.snack_count(db), 3)                        # 처음 2 + 1
+        self.assertIn(("happy", 3), [ctl.anims.get_nowait() for _ in range(ctl.anims.qsize())])
+
+    def test_distraction_resets_the_streak(self):
+        db = connect(":memory:")
+        run(db, RecordingProbe([self.CODE] * 70 + [self.NETFLIX] + [self.CODE] * 70), 10.0, self.quiet(), True)
+        self.assertEqual(cat_app.snack_count(db), 2)                        # 11분 + 11분 — 20분을 못 채움
+
+    def test_distraction_costs_snacks_but_not_below_zero(self):
+        db = connect(":memory:")
+        shorts = [WindowInfo(f"쇼츠{i}", "chrome.exe", f"youtube.com/shorts/{i}") for i in range(3)]
+        ctl = self.quiet("close")
+        run(db, RecordingProbe(shorts), 0.0, ctl, True)
+        self.assertEqual(cat_app.snack_count(db), 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM snack_log WHERE kind = 'lose'").fetchone()[0], 2)
+        self.assertNotIn("간식 -1", ctl.last)                                # 세 번째는 잃을 간식이 없음
+
+    def test_feeding(self):
+        db = connect(":memory:")
+        self.assertTrue(cat_app.feed_cat(db))
+        self.assertEqual((cat_app.snack_count(db), cat_app.get_fullness(db)), (1, 3))
+        self.assertEqual(cat_app.cat_mood(db)[1], "기분 좋음")
+        self.assertTrue(cat_app.feed_cat(db))
+        self.assertFalse(cat_app.feed_cat(db))                               # 간식이 없으면 못 먹임
+        self.assertEqual(cat_app.get_fullness(db), 4)
+
+    def test_gets_hungry_while_running(self):
+        db = connect(":memory:")
+        run(db, RecordingProbe([self.CODE] * 361), 10.0, self.quiet(), True)   # 1시간 조금 넘게
+        self.assertEqual(cat_app.get_fullness(db), 1)
+
+    def test_good_day_gives_bonus_snacks(self):
+        db = connect(":memory:")
+        for n, focus in ((3, 40), (2, 40), (1, 70)):                        # 어제: 집중 30분↑ +5, 평소보다 더 +5, 숏폼 0 +3
+            db.execute("INSERT INTO usage_session (started_at, exe, duration_sec, is_idle, verdict)"
+                       " VALUES (?, 'Code.exe', ?, 0, 'focus')", (days_ago(n), focus * 60))
+        db.commit()
+        cat_app.summarize_and_prune(db)
+        self.assertEqual(db.execute("SELECT delta FROM snack_log WHERE kind = 'bonus' AND reason LIKE '%점수%'")
+                         .fetchall(), [(2,)])                               # 13점 → 간식 2개
 
 
 class TestTimedRule(unittest.TestCase):
@@ -531,7 +583,9 @@ class TestSessionsAndMigration(unittest.TestCase):
         self.assertEqual(db.execute("SELECT subject, operator, value FROM rule_condition WHERE rule_id = 'r_yt_warn'")
                          .fetchall(), [("verdict", "eq", "distract")])     # v8: 딴짓 판정이면 무엇이든
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        self.assertTrue({"focus_checkin", "video_info", "site_kind", "cat_memory", "eye_rest"} <= tables)   # v5·v6·v8 (v9에서 focus_task·allow_item 제거)
+        self.assertTrue({"focus_checkin", "video_info", "site_kind", "cat_memory", "eye_rest",
+                         "snack_log", "cat_state"} <= tables)
+        self.assertEqual(cat_app.cat_mood(db)[3:], (2, 2))                   # v11: 포만감 2, 기념 간식 2   # v5·v6·v8 (v9에서 focus_task·allow_item 제거)
         self.assertIn("site_kind", {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")})
         db.close()
         connect(path).close()                                  # 두 번 열어도 다시 적용되지 않음

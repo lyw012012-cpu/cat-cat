@@ -285,6 +285,23 @@ MIGRATIONS = [
     );
     CREATE INDEX ix_eye_started ON eye_rest(started_at);
     """,
+    # v11: 🐟 간식과 포만감 — 딴짓 안 하면 간식이 생기고, 딴짓하면 없어지고, 간식을 먹은 만큼 고양이 기분이 좋다
+    """
+    CREATE TABLE snack_log (
+        snack_id INTEGER PRIMARY KEY,
+        at       TEXT NOT NULL,
+        delta    INTEGER NOT NULL,                        -- 간식 개수 변화 (+1 벌기, -1 잃기·먹이기)
+        kind     TEXT NOT NULL CHECK (kind IN ('earn', 'lose', 'feed', 'bonus')),
+        reason   TEXT
+    );
+    CREATE TABLE cat_state (
+        key   TEXT PRIMARY KEY,                           -- 'fullness' (포만감 0~5)
+        value TEXT NOT NULL
+    );
+    INSERT INTO cat_state VALUES ('fullness', '2');       -- 처음엔 보통
+    INSERT INTO snack_log (at, delta, kind, reason)
+        VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 2, 'bonus', '처음 만난 기념 간식');
+    """,
 ]
 
 BACKUPS_KEPT = 2        # 업그레이드 전 자동 백업을 최근 몇 개까지 남길지
@@ -401,8 +418,13 @@ def summarize_and_prune(db: sqlite3.Connection, keep_days: int = RETENTION_DAYS)
               AND day NOT IN (SELECT day FROM daily_summary)
             GROUP BY day, exe, host""".replace("{SHORTFORM_EVENT}", SHORTFORM_EVENT))
         for day in sorted({d for (d,) in db.execute("SELECT DISTINCT day FROM daily_summary")} - before):
+            scores = score_day(db, day)
             db.executemany("INSERT INTO cat_memory (day, kind, reason, points, created_at) VALUES (?, ?, ?, ?, ?)",
-                           [(day, kind, reason, points, now_iso()) for kind, reason, points in score_day(db, day)])
+                           [(day, kind, reason, points, now_iso()) for kind, reason, points in scores])
+            total = sum(p for _, _, p in scores)
+            if total >= 10:                                  # 🐟 잘한 날: 5점마다 간식 1개 (최대 3개)
+                db.execute("INSERT INTO snack_log (at, delta, kind, reason) VALUES (?, ?, 'bonus', ?)",
+                           (now_iso(), min(3, total // 5), f"{day} 점수 {total:+d}"))
         cutoff = f"-{keep_days} days"
         db.execute("DELETE FROM usage_session WHERE date(started_at, 'localtime') < date('now', 'localtime', ?)"
                    " AND date(started_at, 'localtime') IN (SELECT day FROM daily_summary)", (cutoff,))
@@ -811,20 +833,72 @@ def checkins_text(db: sqlite3.Connection) -> str:
     return "🐱 어디야?\n" + "\n".join(f"    {t}  {label[a]}" + (f" — {n}" if n else "") for t, a, n in rows)
 
 
-# 😺 고양이 기분 = 최근 점수를 매긴 날의 합계. 기분에 따라 딴짓 단계 간격을 늘이거나 줄인다.
-MOODS = ((10, "😺", "기분 좋음", 2.0),       # +10 이상: 딴짓 영상 차단 시간 2배로 확장 (보상)
-         (-4, "🐱", "보통", 1.0),
-         (None, "😾", "화남", 0.5))          # -5 이하: 절반으로
+# 🐟 간식과 포만감
+SNACK_EVERY_SEC = 20 * 60     # 딴짓 없이 이만큼 지나면 간식 +1 (딴짓하면 처음부터)
+HUNGER_EVERY_SEC = 60 * 60    # 앱이 켜져 있는 동안 이만큼마다 포만감 -1
+FULL_MAX = 5
+
+# 😺 고양이 기분 = 포만감. 기분만큼 딴짓 단계 간격이 바뀐다 (간식을 먹여 기분 좋으면 차단 시간 확장).
+MOODS = ((3, "😺", "기분 좋음", 2.0),        # 포만감 3~5: 딴짓 간격 2배
+         (1, "🐱", "보통", 1.0),             # 1~2
+         (0, "😾", "화남", 0.5))             # 0: 배고파서 화남 — 간격 절반
 
 
-def cat_mood(db: sqlite3.Connection) -> tuple[str, str, float, int | None]:
-    """(얼굴, 이름, 딴짓 간격 배수, 점수). 아직 점수가 없으면 보통."""
-    day = db.execute("SELECT MAX(day) FROM cat_memory WHERE kind IN ('carrot', 'stick')").fetchone()[0]
-    if not day:
-        return "🐱", "보통", 1.0, None
-    score = db.execute("SELECT SUM(points) FROM cat_memory WHERE day = ?", (day,)).fetchone()[0]
-    face, name, mult = next((f, n, m) for t, f, n, m in MOODS if t is None or score >= t)
-    return face, name, mult, score
+def snack_count(db: sqlite3.Connection) -> int:
+    return db.execute("SELECT COALESCE(SUM(delta), 0) FROM snack_log").fetchone()[0]
+
+
+def add_snack(db: sqlite3.Connection, delta: int, kind: str, reason: str) -> None:
+    with db:
+        db.execute("INSERT INTO snack_log (at, delta, kind, reason) VALUES (?, ?, ?, ?)",
+                   (now_iso(), delta, kind, reason))
+
+
+def lose_snack(db: sqlite3.Connection, reason: str) -> bool:
+    """간식이 있으면 하나 잃는다 (0 밑으로는 안 내려감)."""
+    if snack_count(db) <= 0:
+        return False
+    add_snack(db, -1, "lose", reason)
+    return True
+
+
+def get_fullness(db: sqlite3.Connection) -> int:
+    row = db.execute("SELECT value FROM cat_state WHERE key = 'fullness'").fetchone()
+    return int(row[0]) if row else 2
+
+
+def set_fullness(db: sqlite3.Connection, value: int) -> None:
+    with db:
+        db.execute("INSERT INTO cat_state VALUES ('fullness', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                   (str(max(0, min(FULL_MAX, value))),))
+
+
+def feed_cat(db: sqlite3.Connection) -> bool:
+    """간식 하나를 먹인다 → 포만감 +1. 간식이 없으면 False."""
+    if snack_count(db) <= 0:
+        return False
+    with db:
+        db.execute("INSERT INTO snack_log (at, delta, kind, reason) VALUES (?, -1, 'feed', '간식 먹음')", (now_iso(),))
+        db.execute("INSERT INTO cat_state VALUES ('fullness', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                   (str(min(FULL_MAX, get_fullness(db) + 1)),))
+    return True
+
+
+def cat_mood(db: sqlite3.Connection) -> tuple[str, str, float, int, int]:
+    """(얼굴, 이름, 딴짓 간격 배수, 포만감, 간식 수)."""
+    full, snacks = get_fullness(db), snack_count(db)
+    face, name, mult = next((f, n, m) for t, f, n, m in MOODS if full >= t)
+    return face, name, mult, full, snacks
+
+
+def snack_text(db: sqlite3.Connection) -> str:
+    face, name, _, full, snacks = cat_mood(db)
+    rows = db.execute("SELECT kind, SUM(delta), COUNT(*) FROM snack_log"
+                      " WHERE date(at, 'localtime') = date('now', 'localtime') GROUP BY kind").fetchall()
+    got = {k: (d, n) for k, d, n in rows}
+    return (f"🐟 간식 {snacks}개 · 포만감 {'●' * full}{'○' * (FULL_MAX - full)} · {face} {name}\n"
+            f"    오늘: 벌기 +{got.get('earn', (0, 0))[0]} · 잃기 {got.get('lose', (0, 0))[0]}"
+            f" · 먹임 {got.get('feed', (0, 0))[1]}번")
 
 
 def eye_text(db: sqlite3.Connection) -> str:
@@ -846,7 +920,7 @@ def score_text(db: sqlite3.Connection) -> str:
 
 
 def today_text(db: sqlite3.Connection) -> str:
-    return "\n\n".join((breakdown_text(db), checkins_text(db), eye_text(db), score_text(db)))
+    return "\n\n".join((snack_text(db), breakdown_text(db), checkins_text(db), eye_text(db), score_text(db)))
 
 
 def print_report(db: sqlite3.Connection, since: str | None = None) -> None:
@@ -912,7 +986,8 @@ class Control:
         self.site_kinds: dict = {}           # 사이트·앱 → (판정, 출처). 창에서 배우면 바로 여기에 더한다
         self.sites_changed = False           # 공개 목록을 새로 받았으니 다시 읽으라는 신호
         self.eye_on = True                   # 👀 20-20-20 눈 쉬기 (고양이 창에서 끄고 켠다)
-        self.mood = ("🐱", "보통", 1.0, None)  # 😺 고양이 기분 (루프가 시작할 때 정한다)
+        self.mood = ("🐱", "보통", 1.0, 2, 0)  # 😺 (얼굴, 이름, 딴짓 간격 배수, 포만감, 간식 수)
+        self.anims: queue.Queue = queue.Queue()  # 루프 → 움직이는 고양이: (자세, 초)
         self.decided: dict = {}              # "이번만" / "아니, 딴짓" 대답 (이번 실행 동안만)
         self.ui_requests: queue.Queue = queue.Queue()   # 루프 → 창: ("unknown", key, 제목) / ("checkin",)
         self.video_labels: dict = {}         # 영상 ID → (YouTube 카테고리, 사용자 대답)
@@ -973,9 +1048,16 @@ FONT = "맑은 고딕"
 
 
 def control_window(ctl: Control, db_path: str = ":memory:") -> None:
-    """앱이 켜져 있는 동안 떠 있는 창. 모드를 언제든 바꿀 수 있고, 닫으면 앱이 끝난다."""
+    """
+    바탕화면을 돌아다니는 고양이가 앱의 얼굴이다. 모든 조작은 고양이에게:
+      클릭 = 쓰다듬기 · 더블클릭 = 간식 주기 · 오른쪽 클릭 = 메뉴(모드, 눈 쉬기, 오늘 한 일, 배운 것, 끄기)
+    예전 '고양이 창'은 메뉴에서 여는 설정 패널이 됐다 (닫아도 고양이는 남는다).
+    """
+    import random
     import signal
     import tkinter as tk
+
+    from cat_sprite import DesktopCat, draw_cat
 
     uidb = connect(db_path)                  # 창(메인 스레드) 전용 연결 — SQLite 연결은 스레드끼리 나눠 쓰지 않는다
     root = tk.Tk()
@@ -990,12 +1072,32 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         ctl.last = f"모드 변경 → {mode_name(ctl.action)}"
         print(f"=== {ctl.last} ===")
 
+    holder: dict = {}                        # 움직이는 고양이 (아래에서 만든다)
+
     def popup(title: str) -> tk.Toplevel:
         pop = tk.Toplevel(root)
         pop.title(title)
         pop.resizable(False, False)
         pop.attributes("-topmost", True)
+        if "cat" in holder:                  # 질문은 고양이 옆에서
+            x, y = holder["cat"].anchor()
+            pop.geometry(f"+{max(0, x - 60)}+{max(0, y - 200)}")
         return pop
+
+    def cover_cat(cover: tk.Toplevel, pose: str, bg: str) -> None:
+        """화면을 덮을 때 큰 고양이가 나와서 움직인다."""
+        cv = tk.Canvas(cover, width=420, height=330, bg=bg, highlightthickness=0)
+        cv.pack(expand=True, anchor="s")
+        frame = {"t": 0}
+
+        def anim() -> None:
+            if not cover.winfo_exists():
+                return
+            frame["t"] += 1
+            cv.delete("all")
+            draw_cat(cv, 210, 320, pose, frame["t"], 2.0, 1)
+            cover.after(100, anim)
+        anim()
 
     def ask_unknown(key: tuple[str, str], title: str) -> None:
         """모르는 창이 30초 넘게 앞에 있으면: 🐱 이것도 공부야?"""
@@ -1124,7 +1226,8 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
                    command=lambda: setattr(ctl, "eye_on", eye_var.get())).pack()
     status = tk.Label(root, fg="#555", wraplength=260, pady=10, font=("맑은 고딕", 9))
     status.pack()
-    tk.Label(root, text="창을 닫으면 고양이도 쉽니다", fg="#999", font=("맑은 고딕", 8)).pack(pady=(0, 8))
+    tk.Label(root, text="이 창은 닫아도 고양이는 남아요 · 끄기: 고양이 오른쪽 클릭 → 재우기",
+             fg="#999", font=("맑은 고딕", 8)).pack(pady=(0, 8))
 
     def show_delay(seconds: int) -> None:
         """화면 전체를 덮는 '잠깐 기다려' 창. seconds 뒤에 스스로 사라진다."""
@@ -1133,14 +1236,15 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         cover.attributes("-topmost", True)
         cover.attributes("-alpha", 0.92)
         cover.configure(bg="#1b1b1b")
+        cover_cat(cover, "block", "#1b1b1b")                 # 🚪 고양이가 두 팔 벌려 막는다
         text = tk.Label(cover, fg="white", bg="#1b1b1b", font=("맑은 고딕", 30, "bold"))
-        text.pack(expand=True)
+        text.pack(expand=True, anchor="n")
 
         def count(n: int) -> None:
             if n <= 0:
                 cover.destroy()
                 return
-            text.config(text=f"🐱 잠깐!\n\n{n}초만 참아 봐")
+            text.config(text=f"잠깐!\n{n}초만 참아 봐")
             cover.after(1000, count, n - 1)
         count(seconds)
 
@@ -1152,7 +1256,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         cover.attributes("-fullscreen", True)
         cover.attributes("-topmost", True)
         cover.configure(bg="black")
-        tk.Label(cover, text="🐱", font=(FONT, 90), bg="black").pack(expand=True, anchor="s")
+        cover_cat(cover, "look_far", "black")                # 👀 고양이가 먼 곳을 가리킨다
         text = tk.Label(cover, fg="white", bg="black", font=(FONT, 26, "bold"), justify="center")
         text.pack(expand=True, anchor="n")
         tk.Label(cover, text="Esc: 건너뛰기", fg="#666", bg="black", font=(FONT, 10)).pack(pady=20)
@@ -1173,7 +1277,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
             if n <= 0:
                 finish(True)
                 return
-            text.config(text=f"눈 쉬는 시간!\n\n창밖 6미터 먼 곳을 바라봐\n\n{n}")
+            text.config(text=f"눈 쉬는 시간!\n창밖 6미터 먼 곳을 바라봐\n\n{n}")
             cover.after(1000, count, n - 1)
 
         cover.bind("<Escape>", lambda _: finish(False))
@@ -1182,9 +1286,16 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
 
     def tick() -> None:                      # 작업 스레드 소식을 0.5초마다 창에 반영
         status.config(text=ctl.last)
-        face, name, mult, score = ctl.mood
-        mood_label.config(text=f"{face} 기분: {name}" + (f" (최근 {score:+d}점)" if score is not None else "")
+        face, name, mult, full, snacks = ctl.mood
+        mood_label.config(text=f"{face} {name} · 🐟 간식 {snacks}개 · 포만감 {'●' * full}{'○' * (FULL_MAX - full)}"
                           + ("" if mult == 1 else f" · 딴짓 간격 ×{mult:g}"))
+        cat = holder["cat"]
+        cat.set_mood(name)
+        if ctl.last != holder.get("said"):   # 새 소식은 고양이가 말풍선으로
+            holder["said"] = ctl.last
+            cat.say(ctl.last)
+        while not ctl.anims.empty():         # 행동은 고양이가 몸으로
+            cat.act(*ctl.anims.get_nowait())
         while not ctl.ui_requests.empty():
             req = ctl.ui_requests.get_nowait()
             if req[0] == "unknown":
@@ -1203,10 +1314,52 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
             return
         root.after(500, tick)
 
+    def pet() -> None:
+        holder["cat"].act("happy", 2)
+        ctl.last = random.choice(("골골골~ 💕", "기분 좋아 😽", "더 쓰다듬어 줘~", "냐앙 💕"))
+
+    def feed() -> None:
+        if feed_cat(uidb):
+            ctl.mood = cat_mood(uidb)
+            face, name, mult, full, snacks = ctl.mood
+            holder["cat"].act("eat", 3)
+            ctl.last = (f"냠냠! 🐟 포만감 {full}/{FULL_MAX} · 간식 {snacks}개 남음"
+                        + (f" — {face} 기분 좋아! 딴짓 간격 ×{mult:g}" if mult > 1 else ""))
+        else:
+            holder["cat"].act("angry", 2)
+            ctl.last = f"😾 간식이 없잖아! 딴짓 안 하고 {fmt_time(SNACK_EVERY_SEC)} 버티면 생겨"
+
+    def set_mode(action: str) -> None:
+        mode.set(action)
+        switch()
+
+    def toggle_eye() -> None:
+        eye_var.set(not eye_var.get())
+        ctl.eye_on = eye_var.get()
+        ctl.last = "👀 눈 쉬기 켰어" if ctl.eye_on else "👀 눈 쉬기 껐어"
+
+    def show_panel() -> None:
+        root.deiconify()
+        root.lift()
+
+    holder["cat"] = DesktopCat(root, pet=pet, feed=feed, menu=[
+        ("👀 감시 모드", lambda: set_mode("log")),
+        ("💼 업무모드", lambda: set_mode("close")),
+        None,
+        ("🐟 간식 주기", feed),
+        ("👀 눈 쉬기 켜기/끄기", toggle_eye),
+        None,
+        ("📊 오늘 한 일", show_today),
+        ("🧠 배운 것", show_learned),
+        ("⚙️ 고양이 창 열기", show_panel),
+        None,
+        ("👋 고양이 재우기 (끄기)", root.destroy),
+    ])
+    root.protocol("WM_DELETE_WINDOW", root.withdraw)   # 패널을 닫아도 고양이는 남는다
+    root.withdraw()
+
     # 터미널 Ctrl+C로도 끌 수 있게 (Tk 대기 중에는 KeyboardInterrupt가 전달되지 않음)
     signal.signal(signal.SIGINT, lambda *_: root.after(0, root.destroy))
-    root.lift()
-    root.focus_force()
     root.after(0, tick)                      # 창이 다 뜬 뒤에 시작 — 감시 루프가 이미 멈췄어도 깔끔하게 닫히게
     root.mainloop()
     uidb.close()
@@ -1214,6 +1367,8 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
 
 def respond(probe, ctl: Control, response: str, win) -> bool:
     """행동을 실제로 한다. 성공하면 True."""
+    ctl.anims.put({"warn": ("angry", 3), "mute": ("speaker", 5), "delay": ("block", DELAY_SEC),
+                   "close": ("swipe", 3)}[response])     # 🐱 움직이는 고양이가 그 행동을 한다
     if response == "mute":
         ok = probe.mute_app(win.exe, True)
         if ok:
@@ -1235,6 +1390,9 @@ def act(db: sqlite3.Connection, probe, ctl: Control, rule: Rule, win, level: int
     save_event(db, rule, win, ctl.action, response, executed, seconds if timed else None)
     line = rule.reaction.replace("{time}", fmt_time(seconds)).replace("{minutes}", str(seconds // 60))
     words = [line, SAID[response] if executed else "", heads_up(rule, level, ctl.action, seconds)]
+    if lose_snack(db, rule.name):                        # 🐟 딴짓하면 간식이 없어진다
+        ctl.mood = cat_mood(db)
+        words.append(f"간식 -1 (남은 {ctl.mood[4]}개)")
     ctl.last = "🐱 " + " ".join(w for w in words if w)
     print(f"  {ctl.last}")
 
@@ -1272,14 +1430,13 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
         return video_kind(category, user_label, title or w.title, ctl.action)
     instant = [r for r in rules if r.step_sec == 0]         # 창을 열자마자 판정
     # 😺 고양이 기분만큼 딴짓 단계 간격을 늘이거나 줄인다 (기분 좋음 5분 → 10분, 화남 → 2분 30초)
+    timed = [r for r in rules if r.step_sec > 0]
     ctl.mood = cat_mood(db)
-    face, mood_name, mult, _ = ctl.mood
-    timed = [replace(r, step_sec=max(1, int(r.step_sec * mult))) for r in rules if r.step_sec > 0]
-    if mult != 1 and timed:
-        gap = fmt_time(timed[0].step_sec)
-        ctl.last = (f"{face} 고양이 {mood_name}! 오늘은 딴짓 {gap}마다 봐줄게" if mult > 1
-                    else f"{face} 고양이 {mood_name}... 오늘은 딴짓 {gap}마다 혼낼 거야")
+    face, mood_name, mult, full, snacks = ctl.mood
+    ctl.last = f"{face} 안녕! 간식 {snacks}개 있어" + ("" if full else " — 배고파... 🐟")
     eye_timer = 0.0                       # 👀 마지막으로 눈을 쉰 뒤 화면을 본 시간
+    snack_timer = 0.0                     # 🐟 딴짓 없이 지난 시간
+    hunger_timer = 0.0                    # 🐟 마지막으로 배고파진 뒤 앱이 켜져 있던 시간
     # ponytail: 같은 구간에서 두 번 말하지 않게 메모리에만 기억. 하루에 앱을 다시 켜면 현재 구간을 한 번 더 말한다.
     fired: set[tuple] = set()
     streak = 0.0                          # 마지막 "어디야?" 이후 허용된 창에 있은 시간
@@ -1316,6 +1473,14 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     if eye_timer >= EYE_EVERY_SEC:
                         eye_timer = 0.0
                         ctl.ui_requests.put(("eye",))
+            hunger_timer += elapsed                         # 🐟 켜져 있는 동안 조금씩 배고파진다
+            if hunger_timer >= HUNGER_EVERY_SEC:
+                hunger_timer = 0.0
+                if get_fullness(db) > 0:
+                    set_fullness(db, get_fullness(db) - 1)
+                    ctl.mood = cat_mood(db)
+                    if ctl.mood[3] <= 1:
+                        ctl.last = f"{ctl.mood[0]} 배고파... 간식 줘 🐟 (더블클릭)"
             take_fetched()                                  # 뒤에서 가져온 카테고리 반영
             if win is not None:
                 win = replace(win, video_kind=kind_of(win))
@@ -1354,6 +1519,14 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
             # 공부 창(강의 영상 등)은 입력이 없어도 보고 있을 수 있어서 입력으로는 판단하지 않는다.
             idle = ((ctl.checkin_pending and ctl.checkin_waited >= CHECKIN_TIMEOUT_SEC)
                     or (probe.idle_seconds() > IDLE_THRESHOLD_SEC and verdict != "focus"))
+            if win is not None and not idle:                # 🐟 딴짓 없이 20분 → 간식 +1
+                snack_timer = 0.0 if verdict == "distract" else snack_timer + elapsed
+                if snack_timer >= SNACK_EVERY_SEC:
+                    snack_timer = 0.0
+                    add_snack(db, 1, "earn", f"{fmt_time(SNACK_EVERY_SEC)} 딴짓 안 함")
+                    ctl.mood = cat_mood(db)
+                    ctl.last = f"🐟 간식이 생겼어! ({ctl.mood[4]}개) 더블클릭해서 줘"
+                    ctl.anims.put(("happy", 3))
             if tracker.observe(win, elapsed, idle) and win is not None:
                 print(f"[{now_iso()}] {win.exe:<14} {win.title[:50]}")
                 rule = pick_rule(instant, win)
@@ -1365,8 +1538,10 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     if not rule_matches(rule, win):
                         continue
                     seconds = seconds_matching(db, rule, tracker.current.duration_sec)
+                    # 😺 기분(포만감)만큼 간격을 늘이거나 줄인다 — 간식을 먹이면 그 자리에서 바뀐다
+                    rule = replace(rule, step_sec=max(1, int(rule.step_sec * ctl.mood[2])))
                     step = seconds // rule.step_sec
-                    key = (rule.rule_id, date.today(), step)
+                    key = (rule.rule_id, date.today(), step * rule.step_sec)
                     if step >= 1 and key not in fired:
                         # 단계는 '오늘 몇 번째 반응인가' — 카테고리를 늦게 알아서 시간이 건너뛰어도
                         # 말하기 → 소리 → 기다리게 → 닫기를 한 칸씩 밟는다.
