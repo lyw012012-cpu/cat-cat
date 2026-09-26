@@ -18,7 +18,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # 앱처럼 cp949 �
 
 SHORTS = WindowInfo("웃긴영상 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/shorts/x")
 NORMAL = WindowInfo("강의 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/watch?v=a")   # 공부 → 제외
-FUN = WindowInfo("웃긴 고양이 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/watch?v=f")
+FUN = WindowInfo("웃긴 고양이 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/watch?v=ffffffffff1",
+                 video_kind="fun")
 
 
 class RecordingProbe:
@@ -54,7 +55,7 @@ class TestDb(unittest.TestCase):
 
     def test_disabled_rule_is_ignored(self):
         self.db.execute("UPDATE block_rule SET enabled = 0 WHERE rule_id IN ('r_shorts', 'r_reels')")
-        self.assertEqual(pick_rule(load_rules(self.db), SHORTS).rule_id, "r_yt_warn")
+        self.assertIsNone(pick_rule(load_rules(self.db), SHORTS))    # 쇼츠는 영상 종류가 없어서 유튜브 규칙도 안 걸림
 
     def test_bad_action_rejected(self):
         with self.assertRaises(sqlite3.IntegrityError):
@@ -94,54 +95,204 @@ class TestBlock(unittest.TestCase):
 
 
 class TestLadder(unittest.TestCase):
-    """고양이 반응 단계: 말하기 → 소리 끄기 → 기다리게 → 탭 닫기(업무모드만)."""
+    """업무모드: 쇼츠는 바로 닫기, 딴짓 영상은 10초마다 말하기 → 소리 끄기 → 기다리게 → 탭 닫기."""
 
     def test_decide(self):
-        shorts = next(r for r in load_rules(connect(":memory:")) if r.rule_id == "r_shorts")
-        work = [cat_app.decide(shorts, lv, "close", 0) for lv in range(5)]
-        self.assertEqual(work, ["warn", "mute", "delay", "close", "close"])
-        self.assertEqual(cat_app.decide(shorts, 3, "log", 59), "warn")    # 감시 모드: 말하기만
-        self.assertEqual(cat_app.decide(shorts, 0, "log", 60), "mute")    # 1시간 넘으면 소리 끔
+        rules = {r.rule_id: r for r in load_rules(connect(":memory:"))}
+        shorts, fun = rules["r_shorts"], rules["r_yt_warn"]
+        self.assertEqual([cat_app.decide(shorts, lv, "close", 0) for lv in range(3)], ["close"] * 3)
+        self.assertEqual([cat_app.decide(fun, lv, "close", 0) for lv in range(5)],
+                         ["warn", "mute", "delay", "close", "close"])
+        self.assertEqual(cat_app.decide(shorts, 3, "log", 3599), "warn")    # 감시 모드: 말하기만
+        self.assertEqual(cat_app.decide(shorts, 0, "log", 3600), "mute")    # 1시간 넘으면 소리 끔
 
-    def test_shorts_climb_the_ladder_and_mode_switch(self):
+    def test_shorts_closed_at_once_in_work_mode(self):
         ctl = Control("log")
         shorts = [WindowInfo(f"쇼츠{i}", "chrome.exe", f"youtube.com/shorts/{i}") for i in range(4)]
-        frames = shorts + [WindowInfo("main.py - VS Code", "Code.exe")]
         # 첫 쇼츠는 감시 모드에서 보고, 그다음 업무모드로 바꾼다
-        probe = RecordingProbe(frames, on_frame=lambda left: setattr(ctl, "action", "close") if left == 4 else None)
+        probe = RecordingProbe(shorts, on_frame=lambda left: setattr(ctl, "action", "close") if left == 3 else None)
         db = connect(":memory:")
         run(db, probe, 0.0, ctl, stop_when_empty=True)
-
         self.assertEqual(db.execute("SELECT mode, response, executed FROM block_event ORDER BY event_id").fetchall(),
-                         [("log", "warn", 1), ("close", "mute", 1), ("close", "delay", 1), ("close", "close", 1)])
-        self.assertEqual(probe.calls, ["mute", "close", "unmute"])   # VS Code로 옮기자 소리를 돌려줌
-        self.assertEqual(ctl.delay_request, cat_app.DELAY_SEC)       # 기다리게 화면 요청
-        self.assertIsNone(ctl.muted_exe)
+                         [("log", "warn", 1)] + [("close", "close", 1)] * 3)
+        self.assertEqual(probe.calls, ["close"] * 3)                 # 업무모드 첫 쇼츠부터 바로 닫음
+
+    def test_fun_video_steps_every_10_seconds(self):
+        db = connect(":memory:")
+        ctl = Control("close")
+        probe = RecordingProbe([FUN] * 5 + [WindowInfo("main.py - VS Code", "Code.exe")])
+        run(db, probe, 10.0, ctl, True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
+                         [(10, "warn"), (20, "mute"), (30, "delay"), (40, "close"), (50, "close")])
+        self.assertEqual(probe.calls, ["mute", "close", "close", "unmute"])   # VS Code로 옮기자 소리를 돌려줌
+        self.assertEqual(ctl.delay_request, cat_app.DELAY_SEC)
+
+    def test_never_skips_a_step(self):
+        """이미 35초 본 상태(카테고리를 늦게 알았거나 아까 본 것)여도 첫 반응은 말하기부터 한 칸씩."""
+        db = connect(":memory:")
+        t = now_iso()
+        save_session(db, Session(t, "chrome.exe", "예능", "youtube.com/watch?v=aaaaaaaaaaa", 35, False, t),
+                     video_kind="fun")
+        run(db, RecordingProbe([FUN] * 2), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
+                         [(40, "warn"), (50, "mute")])
+
+
+class TestTalkAndCounts(unittest.TestCase):
+    """숏폼 2개 봤는데 25개로 뜨던 버그 · 고양이 예고 · 오늘 한 일."""
+
+    def test_old_version_records_do_not_raise_the_step(self):
+        db = connect(":memory:")
+        for _ in range(23):                                    # 옛 버전 기록: response 없음
+            db.execute("INSERT INTO block_event (occurred_at, rule_id, action) VALUES (?, 'r_shorts', 'close')",
+                       (now_iso(),))
+        db.commit()
+        shorts = [WindowInfo(f"쇼츠{i}", "chrome.exe", f"youtube.com/shorts/{i}") for i in range(2)]
+        run(db, RecordingProbe(shorts), 0.0, Control("close"), True)
+        self.assertEqual(db.execute("SELECT response FROM block_event WHERE response IS NOT NULL"
+                                    " ORDER BY event_id").fetchall(), [("close",), ("close",)])
+        seen = db.execute(f"SELECT COUNT(*) FROM block_event WHERE {cat_app.SHORTFORM_EVENT}").fetchone()[0]
+        self.assertEqual(seen, 2)                                                              # 리포트도 2회
+
+    def test_cat_warns_what_comes_next(self):
+        rules = {r.rule_id: r for r in load_rules(connect(":memory:"))}
+        H = cat_app.heads_up
+        self.assertEqual(H(rules["r_shorts"], 0, "close", 0), "업무 중엔 쇼츠 금지야.")
+        self.assertEqual(H(rules["r_shorts"], 0, "log", 0), "60분 더 보면 소리 안 들리게 할 거야.")
+        self.assertEqual(H(rules["r_yt_warn"], 0, "close", 10), "10초 더 보면 소리 안 들리게 할 거야.")
+        self.assertEqual(H(rules["r_yt_warn"], 2, "close", 30), "10초 더 보면 꺼 버릴 거야.")
+        self.assertEqual(H(rules["r_yt_warn"], 3, "close", 40), "계속 보면 계속 꺼 버릴 거야.")
+        self.assertEqual(H(rules["r_yt_warn"], 0, "log", 15 * 60), "45분 더 보면 소리 안 들리게 할 거야.")
+        self.assertEqual([cat_app.fmt_time(x) for x in (40, 130, 600)], ["40초", "2분 10초", "10분"])
+
+    def test_message_has_no_process_labels(self):
+        ctl = Control("close")
+        run(connect(":memory:"), RecordingProbe([SHORTS]), 0.0, ctl, True)
+        self.assertEqual(ctl.last, "🐱 또 쇼츠야? 꺼 버렸어. 업무 중엔 쇼츠 금지야.")
+
+    def test_today_breakdown_lists_what_was_done(self):
+        db = connect(":memory:")
+        t = now_iso()
+        for title, exe, url, sec, verdict in (
+                ("main.py - VS Code", "Code.exe", None, 900, "focus"),
+                ("파이썬 강의 21강", "chrome.exe", "youtube.com/watch?v=a&list=PL1", 600, "focus"),
+                ("웃긴 영상", "chrome.exe", "youtube.com/watch?v=b", 300, "distract"),
+                ("옛 기록", "x.exe", None, 999, None)):                       # v5 이전 기록은 빠짐
+            save_session(db, Session(t, exe, title, url, sec, False, t), verdict)
+        b = cat_app.today_breakdown(db)
+        self.assertEqual(b["focus"], [("Code.exe", 15.0, ["main.py - VS Code"]),
+                                      ("youtube.com", 10.0, ["파이썬 강의 21강"])])
+        self.assertEqual(b["distract"], [("youtube.com", 5.0, ["웃긴 영상"])])
+        self.assertNotIn(None, b)
+        self.assertIn("📚 집중 25분", cat_app.breakdown_text(db))
+
+    def test_cat_own_window_is_ignored(self):
+        """고양이 창(오늘 뭐 할 거야? 등)에 대답하는 시간은 모름으로 세지 않고, 묻지도 않는다."""
+        db = connect(":memory:")
+        ctl = Control("close")
+        ctl.task_id = cat_app.get_or_create_task(db, "파이썬 강의")
+        own = WindowInfo("오늘 뭐 할 거야?", "python.exe", pid=os.getpid())
+        run(db, RecordingProbe([own] * 10), 10.0, ctl, True)
+        self.assertTrue(ctl.ui_requests.empty())
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM usage_session").fetchone()[0], 0)
+
+    def test_report_splits_this_run_from_today(self):
+        db = connect(":memory:")
+        db.execute("INSERT INTO usage_session (started_at, exe, duration_sec, is_idle)"
+                   " VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-5 seconds'), 'WindowsTerminal.exe', 1500, 0)")
+        started = now_iso()
+        save_session(db, Session(started, "WindowsTerminal.exe", "t", None, 300, False, started), "unknown")
+        self.assertEqual(cat_app.top_apps_today(db, since=started), [("WindowsTerminal.exe", 300.0)])
+        self.assertEqual(cat_app.top_apps_today(db), [("WindowsTerminal.exe", 1800.0)])
+
+
+class TestVideoKind(unittest.TestCase):
+    """HATENA(노래)처럼 제목에 단서가 없어도 YouTube 카테고리로 강의·노래·딴짓을 나눈다."""
+
+    def test_mapping(self):
+        K = cat_app.video_kind
+        self.assertEqual(K("Music", None, "HATENA", "close"), "music")
+        self.assertEqual(K("Education", None, "1강", "close"), "lecture")
+        self.assertEqual(K("Gaming", None, "롤 하이라이트", "close"), "fun")
+        self.assertEqual(K("Entertainment", None, "예능", "close"), "ask")        # 애매 → 업무모드는 물어봄
+        self.assertEqual(K("Entertainment", None, "예능", "log"), "fun")          # 감시 모드는 안 묻고 딴짓
+        self.assertEqual(K("Entertainment", None, "파이썬 강의 3편", "close"), "lecture")   # 제목 키워드 보조
+        self.assertEqual(K("", None, "?", "close"), "ask")                         # 카테고리를 못 읽음
+        self.assertEqual(K("Gaming", "lecture", "게임 개발 강좌", "close"), "lecture")    # 사용자 대답이 최우선
+        self.assertIsNone(K(None, None, "가져오는 중", "close"))
+        self.assertEqual(cat_app.video_id("youtube.com/watch?v=dQw4w9WgXcQ&list=PL1"), "dQw4w9WgXcQ")
+        self.assertIsNone(cat_app.video_id("youtube.com/shorts/abc"))
+
+    def video(self, vid, title="HATENA - YouTube - Chrome"):
+        return WindowInfo(title, "chrome.exe", f"https://www.youtube.com/watch?v={vid}")
+
+    def test_music_is_focus_and_never_warned(self):
+        db = connect(":memory:")
+        t = now_iso()
+        save_session(db, Session(t, "chrome.exe", "노래", "youtube.com/watch?v=mmmmmmmmmm0", 3600, False, t),
+                     video_kind="music")                                          # 오늘 노래 1시간
+        ctl = Control("close")
+        run(db, RecordingProbe([self.video("mmmmmmmmmm1")] * 30), 10.0, ctl, True, fetch=lambda v: "Music")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM block_event").fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT verdict, video_kind FROM usage_session ORDER BY session_id DESC"
+                                    " LIMIT 1").fetchone(), ("focus", "music"))
+        self.assertEqual(db.execute("SELECT category FROM video_info WHERE video_id = 'mmmmmmmmmm1'").fetchone(),
+                         ("Music",))                                              # 한 번 읽은 카테고리는 저장
+
+    def test_ambiguous_video_asks_in_work_mode(self):
+        db = connect(":memory:")
+        ctl = Control("close")
+        v = self.video("eeeeeeeeee1", "예능 모음 - YouTube - Chrome")
+        run(db, RecordingProbe([v] * 3), 10.0, ctl, True, fetch=lambda vid: "Entertainment")
+        self.assertEqual(ctl.ui_requests.get_nowait(), ("video", "eeeeeeeeee1", v.title))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM block_event").fetchone()[0], 0)   # 대답 전엔 벌 안 줌
+
+    def test_session_keeps_latest_title(self):
+        """유튜브는 주소가 먼저 바뀌고 제목이 몇 초 뒤에 바뀐다 → 기록엔 나중 제목(진짜 제목)이 남아야 한다."""
+        db = connect(":memory:")
+        url = "https://www.youtube.com/watch?v=UW1a3h9Hlf4"
+        frames = [WindowInfo("メルト - YouTube", "chrome.exe", url)] * 2 + [WindowInfo("HATENA - YouTube", "chrome.exe", url)] * 3
+        run(db, RecordingProbe(frames), 1.0, Control("log"), True, fetch=lambda v: "Music")
+        self.assertEqual(db.execute("SELECT window_title FROM usage_session").fetchall(), [("HATENA - YouTube",)])
+
+    def test_answer_is_remembered(self):
+        db = connect(":memory:")
+        cat_app.save_video(db, "eeeeeeeeee2", category="Entertainment")
+        cat_app.save_video(db, "eeeeeeeeee2", user_label="lecture")               # "📚 강의야"
+        ctl = Control("close")
+        fetched = []
+        run(db, RecordingProbe([self.video("eeeeeeeeee2", "예능?")] * 3), 10.0, ctl, True,
+            fetch=lambda vid: fetched.append(vid) or "Entertainment")
+        self.assertEqual(fetched, [])                                             # 다시 읽지도, 묻지도 않음
+        self.assertTrue(ctl.ui_requests.empty())
+        self.assertEqual(db.execute("SELECT category, user_label FROM video_info").fetchone(),
+                         ("Entertainment", "lecture"))
 
 
 class TestTimedRule(unittest.TestCase):
-    """유튜브(공부·음악 제외)는 오늘 누적 5분 구간마다 한 번 반응한다."""
+    """딴짓 영상은 오늘 누적 10초 구간마다 한 번 반응한다 (강의·노래 시간은 안 셈)."""
 
     def run_on(self, fun_minutes, mode, study_minutes=0):
         db = connect(":memory:")
         t = now_iso()
-        save_session(db, Session(t, "chrome.exe", "예능 - YouTube", "youtube.com/watch?v=a", fun_minutes * 60, False, t))
+        save_session(db, Session(t, "chrome.exe", "예능 - YouTube", "youtube.com/watch?v=aaaaaaaaaaa",
+                                 fun_minutes * 60, False, t), video_kind="fun")
         if study_minutes:
-            save_session(db, Session(t, "chrome.exe", "파이썬 강의 - YouTube", "youtube.com/watch?v=s",
-                                     study_minutes * 60, False, t))
+            save_session(db, Session(t, "chrome.exe", "파이썬 강의 - YouTube", "youtube.com/watch?v=sssssssssss",
+                                     study_minutes * 60, False, t), video_kind="lecture")
         probe = RecordingProbe([FUN] * 3)
         ctl = Control(mode)
-        run(db, probe, 0.0, ctl, stop_when_empty=True)
+        run(db, probe, 0.0, ctl, stop_when_empty=True, fetch=lambda vid: "Comedy")
         return db, probe, ctl
 
     def test_once_per_step_in_watch_mode(self):
         db, probe, ctl = self.run_on(30.5, "log")
-        self.assertEqual(db.execute("SELECT minutes, response FROM block_event").fetchall(), [(30, "warn")])
-        self.assertIn("유튜브 30분째야", ctl.last)
+        self.assertEqual(db.execute("SELECT seconds, response FROM block_event").fetchall(), [(1830, "warn")])
+        self.assertIn("딴짓 영상 30분 30초째야", ctl.last)
 
     def test_study_time_is_not_counted(self):
-        db, _, _ = self.run_on(7, "log", study_minutes=50)          # 공부 50분은 세지 않음 → 5분 구간 1
-        self.assertEqual(db.execute("SELECT minutes FROM block_event").fetchall(), [(5,)])
+        db, _, _ = self.run_on(7, "log", study_minutes=50)          # 공부 50분은 세지 않음 → 딴짓 7분만
+        self.assertEqual(db.execute("SELECT seconds FROM block_event").fetchall(), [(420,)])
 
     def test_watch_mode_mutes_after_an_hour(self):
         db, probe, _ = self.run_on(61, "log")
@@ -172,20 +323,22 @@ class TestSessionsAndMigration(unittest.TestCase):
         db = connect(path)
         self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], len(cat_app.MIGRATIONS))
         self.assertEqual(db.execute("SELECT duration_sec FROM usage_session").fetchall(), [(5.0,)])
-        self.assertEqual(db.execute("SELECT reaction, min_minutes, action FROM block_rule").fetchone(),
-                         ("유튜브 {minutes}분째야.", 5, "close"))
+        self.assertEqual(db.execute("SELECT reaction, step_sec, action FROM block_rule").fetchone(),
+                         ("딴짓 영상 {time}째야.", 10, "close"))                # v7: 10초마다
         self.assertEqual(db.execute("SELECT operator FROM rule_condition WHERE rule_id = 'r_yt_warn'").fetchall(),
-                         [("not_regex",)])                     # v4: 공부·음악 제외 조건이 붙음
+                         [("not_regex",)])                     # v4: 강의·노래 제외 조건이 붙음
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        self.assertTrue({"focus_task", "allow_item", "focus_checkin"} <= tables)   # v5
+        self.assertTrue({"focus_task", "allow_item", "focus_checkin", "video_info"} <= tables)   # v5, v6
+        self.assertEqual(db.execute("SELECT subject, value FROM rule_condition WHERE rule_id = 'r_yt_warn'").fetchall(),
+                         [("video_kind", "^(lecture|music|ask)$")])             # v6: 제목 대신 영상 종류
         db.close()
         connect(path).close()                                  # 두 번 열어도 다시 적용되지 않음
 
 
 def days_ago(n: int) -> str:
-    """n일 전 UTC 03:00 (한국 12:00) — 현지 날짜가 정확히 n일 전이 되게."""
-    d = datetime.now(timezone.utc) - timedelta(days=n)
-    return d.strftime("%Y-%m-%dT03:00:00Z")
+    """현지 날짜로 n일 전 정오를 UTC 문자열로 — 자정 직후처럼 UTC 날짜와 현지 날짜가 다를 때도 정확하게."""
+    local_noon = datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=n)
+    return local_noon.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TestMemoryAndRetention(unittest.TestCase):
@@ -196,8 +349,8 @@ class TestMemoryAndRetention(unittest.TestCase):
         db.execute("INSERT INTO usage_session (started_at, ended_at, exe, url_host, duration_sec, is_idle)"
                    " VALUES (?, ?, 'chrome.exe', ?, ?, 0)", (t, t, host, sec))
         for i in range(shorts):
-            db.execute("INSERT INTO block_event (occurred_at, rule_id, action, exe, url_host, mode, executed)"
-                       " VALUES (?, 'r_shorts', 'close', 'chrome.exe', ?, 'close', ?)", (t, host, int(i < closed)))
+            db.execute("INSERT INTO block_event (occurred_at, rule_id, action, exe, url_host, mode, response, executed)"
+                       " VALUES (?, 'r_shorts', 'close', 'chrome.exe', ?, 'close', 'close', ?)", (t, host, int(i < closed)))
         db.commit()
 
     def test_summarize_then_prune(self):
@@ -237,43 +390,37 @@ class TestMemoryAndRetention(unittest.TestCase):
 class TestFocus(unittest.TestCase):
     """오늘 뭐 할 거야? — 허용 목록, 모르는 창 묻기, 20분마다 어디야?"""
 
-    PLAYLIST = "https://www.youtube.com/watch?v=aaa&list=PLz2iXe7EqJOOTNTK27a4-WsgZU5NVfguh&index=3"
-
-    def test_parse_allow(self):
-        P = cat_app.parse_allow
-        self.assertEqual(P(self.PLAYLIST), ("playlist", "PLz2iXe7EqJOOTNTK27a4-WsgZU5NVfguh"))
-        self.assertEqual(P("Code.exe"), ("app", "Code.exe"))
-        self.assertEqual(P("https://www.docs.python.org/3/tutorial/"), ("host", "docs.python.org"))
-        self.assertEqual(P("SQLD 기출"), ("keyword", "SQLD 기출"))
-
-    def test_playlist_allows_next_video(self):
-        items = [cat_app.parse_allow(self.PLAYLIST)]
-        nxt = WindowInfo("다음 강의", "chrome.exe",
-                         "youtube.com/watch?v=bbb&list=PLz2iXe7EqJOOTNTK27a4-WsgZU5NVfguh&index=4")
-        other = WindowInfo("다른 영상", "chrome.exe", "youtube.com/watch?v=ccc")
-        self.assertTrue(cat_app.is_allowed(nxt, items))      # v= 가 바뀌어도 list= 가 같으면 허용
-        self.assertFalse(cat_app.is_allowed(other, items))
-
     def test_host_allows_whole_site(self):
         items = [("host", "python.org")]
         self.assertTrue(cat_app.is_allowed(WindowInfo("t", "chrome.exe", "docs.python.org/3/library/re.html"), items))
         self.assertFalse(cat_app.is_allowed(WindowInfo("t", "chrome.exe", "notpython.org/x"), items))
 
+    def test_builtin_auto_classification(self):
+        """할 일을 고르지 않아도 흔한 공부·업무 앱/사이트와 딴짓 사이트는 자동으로 나뉜다."""
+        B = cat_app.builtin_kind
+        self.assertEqual(B(WindowInfo("main.py", "Code.exe")), "focus")
+        self.assertEqual(B(WindowInfo("과제.hwp", "Hwp.exe")), "focus")
+        self.assertEqual(B(WindowInfo("t", "chrome.exe", "github.com/x")), "focus")
+        self.assertEqual(B(WindowInfo("t", "chrome.exe", "docs.python.org/3/")), "focus")
+        self.assertEqual(B(WindowInfo("t", "chrome.exe", "eclass.kangwon.ac.kr/x")), "focus")   # 대학 사이트
+        self.assertEqual(B(WindowInfo("t", "chrome.exe", "www.netflix.com/browse")), "distract")
+        self.assertEqual(B(WindowInfo("롤", "LeagueClient.exe")), "distract")
+        self.assertIsNone(B(WindowInfo("t", "chrome.exe", "someblog.net/post")))
+        self.assertIsNone(B(WindowInfo("t", "Discord.exe")))
+
     def test_classify_order(self):
         rules = load_rules(connect(":memory:"))
-        so = WindowInfo("질문", "chrome.exe", "stackoverflow.com/q/1")
+        so = WindowInfo("질문", "chrome.exe", "someblog.net/q/1")
         self.assertEqual(cat_app.classify(SHORTS, rules, [("host", "youtube.com")], {}), "distract")  # 규칙이 먼저
         self.assertEqual(cat_app.classify(so, rules, [], {}), "unknown")
-        self.assertEqual(cat_app.classify(so, rules, [], {("host", "stackoverflow.com"): "focus"}), "focus")
-        self.assertEqual(cat_app.classify(so, rules, [("host", "stackoverflow.com")], {}), "focus")
+        self.assertEqual(cat_app.classify(so, rules, [], {("host", "someblog.net"): "focus"}), "focus")
+        self.assertEqual(cat_app.classify(so, rules, [("host", "someblog.net")], {}), "focus")
 
     def test_ask_unknown_then_checkin_then_away(self):
+        """할 일을 고르지 않아도: 모르는 사이트 30초 → 묻기, 공부 앱 20분 → 어디야?, 무응답 3분 → 자리 비움."""
         db = connect(":memory:")
-        ctl = Control("close")
-        ctl.task_id = cat_app.get_or_create_task(db, "파이썬 강의")
-        cat_app.add_allow(db, ctl.task_id, "app", "Code.exe")
-        ctl.allow_items = cat_app.load_allow(db, ctl.task_id)
-        so = WindowInfo("질문 - Stack Overflow", "chrome.exe", "stackoverflow.com/q/1")
+        ctl = Control("close")                                  # 할 일 없이 업무모드
+        so = WindowInfo("질문 - 어떤 블로그", "chrome.exe", "someblog.net/q/1")
         code = WindowInfo("main.py - VS Code", "Code.exe")
         # 10초 간격: 모르는 창 30초 → 허용된 창 20분 → 대답 없이 3분 넘게 더
         frames = [so] * 3 + [code] * 120 + [code] * 20
@@ -282,10 +429,10 @@ class TestFocus(unittest.TestCase):
         reqs = []
         while not ctl.ui_requests.empty():
             reqs.append(ctl.ui_requests.get_nowait())
-        self.assertEqual(reqs, [("unknown", ("host", "stackoverflow.com"), so.title), ("checkin",)])
+        self.assertEqual(reqs, [("unknown", ("host", "someblog.net"), so.title), ("checkin",)])
         verdicts = db.execute("SELECT exe, verdict FROM usage_session ORDER BY session_id").fetchall()
         self.assertEqual(verdicts, [("chrome.exe", "unknown"), ("Code.exe", "focus"), ("Code.exe", "away")])
-        self.assertEqual(db.execute("SELECT DISTINCT task_id FROM usage_session").fetchall(), [(ctl.task_id,)])
+        self.assertEqual(ctl.task_id, cat_app.get_or_create_task(db, cat_app.AUTO_TASK))   # 배운 건 '자동 분류' 한 목록에
 
     def test_watch_mode_never_asks(self):
         db = connect(":memory:")

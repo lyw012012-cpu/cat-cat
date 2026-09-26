@@ -56,6 +56,8 @@ class WindowInfo:
     exe: str                        # 실행 파일명 (chrome.exe)
     url: Optional[str] = None       # 브라우저면 주소, 아니면 None
     hwnd: int = 0                   # 창 핸들 (닫을 때 필요)
+    pid: int = 0                    # 프로세스 번호 (고양이 앱 자기 창을 알아보는 데 씀)
+    video_kind: Optional[str] = None  # 유튜브 영상 종류: lecture/music/fun/ask, 아직 모르면 None
 
     @property
     def key(self) -> tuple:
@@ -113,15 +115,21 @@ class WindowsProbe:
             return None
 
         title = self._window_title(hwnd)
+        pid = self._window_pid(hwnd)
         exe = self._process_name(hwnd)
         url = self._browser_url(hwnd, exe)
-        return WindowInfo(title=title, exe=exe, url=url, hwnd=hwnd)
+        return WindowInfo(title=title, exe=exe, url=url, hwnd=hwnd, pid=pid)
 
     def _window_title(self, hwnd: int) -> str:
         length = self.user32.GetWindowTextLengthW(hwnd)
         buf = self.ctypes.create_unicode_buffer(length + 1)
         self.user32.GetWindowTextW(hwnd, buf, length + 1)
         return buf.value
+
+    def _window_pid(self, hwnd: int) -> int:
+        pid = self._wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(hwnd, self.ctypes.byref(pid))
+        return pid.value
 
     def _process_name(self, hwnd: int) -> str:
         pid = self._wintypes.DWORD()
@@ -283,7 +291,7 @@ class SimulatedProbe:
 @dataclass(frozen=True)
 class Condition:
     group_no: int
-    subject: str        # 'app' | 'url' | 'window_title'
+    subject: str        # 'app' | 'url' | 'window_title' | 'video_kind'
     operator: str       # 'eq' | 'contains' | 'regex' | 'not_regex'(이 패턴이 없어야 맞음)
     value: str
 
@@ -295,8 +303,8 @@ class Rule:
     action: str         # 고양이가 올라갈 수 있는 최대 단계: 'warn' < 'mute' < 'delay' < 'close'
     priority: int
     conditions: tuple[Condition, ...]
-    reaction: str = ""       # {minutes} 가 있으면 누적 분으로 채운다
-    min_minutes: int = 0     # 0이면 창을 열자마자, N이면 오늘 그 사이트/앱 누적 N분마다 발동
+    reaction: str = ""       # {time} 이 있으면 누적 시간("40초", "2분 10초")으로 채운다
+    step_sec: int = 0        # 0이면 창을 열자마자, N이면 오늘 누적 N초마다 한 단계씩 발동
 
 
 def _subject_value(win: WindowInfo, subject: str) -> Optional[str]:
@@ -304,6 +312,7 @@ def _subject_value(win: WindowInfo, subject: str) -> Optional[str]:
         "app": win.exe,
         "url": win.url,
         "window_title": win.title,
+        "video_kind": win.video_kind,
     }.get(subject)
 
 
@@ -363,12 +372,13 @@ DEFAULT_RULES: tuple[Rule, ...] = (
     ),
     Rule(
         rule_id="r_yt_warn", name="유튜브 (공부·음악 제외)", action="close", priority=50,
-        reaction="유튜브 {minutes}분째야.", min_minutes=5,
+        reaction="딴짓 영상 {time}째야.", step_sec=10,
         conditions=(
-            # group 0 AND group 1 AND group 2 — 크롬이면서, 유튜브이고, 공부·음악 영상이 아니어야 한다
+            # group 0 AND group 1 AND group 2 — 크롬이면서, 유튜브이고, 딴짓 영상이어야 한다.
+            # 영상 종류는 YouTube 카테고리로 자동 분류(강의·노래는 제외, 애매하면 사용자에게 물어봄).
             Condition(0, "app", "eq", "chrome.exe"),
             Condition(1, "url", "contains", "youtube.com"),
-            Condition(2, "window_title", "not_regex", STUDY_WORDS),
+            Condition(2, "video_kind", "not_regex", "^(lecture|music|ask)$"),
         ),
     ),
 )
@@ -423,6 +433,9 @@ class SessionTracker:
 
         if self.current and key == cur_key:
             self.current.duration_sec += elapsed
+            # 제목은 '마지막으로 본 것'으로 갱신한다. 유튜브는 다음 영상으로 넘어가면 주소가 먼저 바뀌고
+            # 탭 제목은 몇 초 뒤에 바뀌어서, 처음 제목을 쓰면 이전 영상 제목이 남는다.
+            self.current.title = win.title
             return False
 
         self.flush()

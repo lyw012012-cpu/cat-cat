@@ -106,12 +106,12 @@ class TestPriority(unittest.TestCase):
         self.assertIsNone(pick_rule(DEFAULT_RULES, NORMAL_VIDEO))
 
     def test_fun_video_is_caught_by_youtube_rule(self):
-        fun = WindowInfo("웃긴 고양이 모음 - YouTube - Chrome", "chrome.exe",
-                         "https://www.youtube.com/watch?v=zzz")
-        self.assertEqual(pick_rule(DEFAULT_RULES, fun).rule_id, "r_yt_warn")
-        music = WindowInfo("공부할 때 듣는 lofi 플레이리스트 - YouTube - Chrome", "chrome.exe",
-                           "https://www.youtube.com/watch?v=lofi")
-        self.assertIsNone(pick_rule(DEFAULT_RULES, music))
+        """유튜브 규칙은 영상 종류(YouTube 카테고리로 분류)를 본다: 딴짓만 걸리고 강의·노래·애매함은 안 걸림."""
+        url = "https://www.youtube.com/watch?v=zzzzzzzzzzz"
+        kinds = {k: pick_rule(DEFAULT_RULES, WindowInfo("HATENA - YouTube - Chrome", "chrome.exe", url, video_kind=k))
+                 for k in ("fun", "music", "lecture", "ask", None)}
+        self.assertEqual(kinds["fun"].rule_id, "r_yt_warn")
+        self.assertEqual([k for k, r in kinds.items() if r], ["fun"])
 
     def test_no_rule_for_editor(self):
         self.assertIsNone(pick_rule(DEFAULT_RULES, VSCODE))

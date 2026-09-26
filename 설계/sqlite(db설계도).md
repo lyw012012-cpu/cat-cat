@@ -1,4 +1,4 @@
-> 고양이 앱 DB는 테이블 9개 (스키마 v5). **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
+> 고양이 앱 DB는 테이블 10개 (스키마 v7). **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
 
 - 코드: `cat_app.py`의 `SCHEMA` · DB 파일: `%LOCALAPPDATA%\cat-app\cat.db` (개인정보라 OneDrive·git 밖 PC 로컬에 둠)
 - 관련: [[진행도]] · [[고양이-생산성-앱-프로젝트]] · [[프로젝트 일정]]
@@ -45,6 +45,12 @@ erDiagram
         TEXT answered_at "NULL=대답 안 함"
         TEXT answer "focus/break"
         TEXT note "어디까지 했어?"
+    }
+    video_info {
+        TEXT video_id PK "watch?v= 11자"
+        TEXT category "YouTube 카테고리, ''=못 읽음"
+        TEXT user_label "lecture/music/fun"
+        TEXT fetched_at
     }
     cat_memory {
         INTEGER memory_id PK
@@ -93,6 +99,7 @@ erDiagram
         TEXT url_host "집계용"
         TEXT url "v1: 전체 주소 (쇼츠/강의 구분)"
         TEXT verdict "v5: focus/distract/unknown/away"
+        TEXT video_kind "v6: lecture/music/fun/ask"
         INTEGER task_id FK "v5: 그때 할 일"
         REAL duration_sec
         INTEGER is_idle "0/1"
@@ -153,6 +160,8 @@ erDiagram
 | 버전 | 내용 |
 |---|---|
 | v0 | 테이블 4개 (최초) |
+| v7 (2026-09-27) | 단계 간격 분 → 초: `block_rule.step_sec` 추가 (딴짓 영상 **10초마다**), `block_event.seconds` 추가 · 업무모드 쇼츠는 첫 번째부터 바로 닫기(코드) · 단계는 한 번에 한 칸씩(오늘 몇 번째 반응인가) · 백업 `cat.backup-v6.db` |
+| v6 (2026-09-26) | `video_info` 추가 · `usage_session.video_kind` · `rule_condition.subject`에 `video_kind` 추가 (CHECK 변경이라 재생성) · 유튜브 규칙이 제목 대신 영상 종류를 봄 · 백업 `cat.backup-v5.db` |
 | v5 (2026-09-26) | `focus_task`, `allow_item`, `focus_checkin` 추가 · `usage_session.verdict/task_id` · `daily_summary` 집중·딴짓·모름 분 · 백업 `cat.backup-v4.db` |
 | v4 (2026-09-26) | 반응 단계 도입: `block_rule.action`은 **최대 단계**, `block_event.response`에 실제 행동 기록 · `rule_condition.operator`에 `not_regex` 추가 (CHECK 변경이라 테이블 재생성) · 유튜브 규칙에 "공부·음악 제목 제외" 조건 · 백업 `cat.backup-v3.db` |
 | v3 (2026-09-26) | `daily_summary`, `cat_memory` 테이블 추가 · `block_event.occurred_at` 인덱스 · 원본 90일 보관 정책 (`RETENTION_DAYS`) |
@@ -175,7 +184,20 @@ erDiagram
 
 **훈련 기억 아이디어:** `daily_summary`로 최근 7일 평균 유튜브 분을 계산 → 오늘이 평균보다 적으면 🥕, 많으면 🪓 → 결과를 `cat_memory`에 남김. (점수 규칙은 추후 결정)
 
-## 업무·공부 판정 (v5)
+## 유튜브 영상 종류 (v6)
+`video_kind` = **사용자 대답 > YouTube 카테고리 > 제목 키워드** 순서로 정한다 (`video_kind()`).
+- 카테고리는 영상 페이지의 `"category":"…"`를 한 번 읽어 `video_info`에 캐시 (API 키 없음, 영상당 1회, 감시가 멈추지 않게 별도 스레드)
+- Music → `music`, Education/Science & Technology/Howto & Style → `lecture`, Gaming/Comedy/Sports… → `fun`, 그 밖·못 읽음 → `ask`
+- `ask`: 업무모드는 10초 뒤 "이거 강의 맞아?" → `video_info.user_label`에 저장 + `cat_memory` 훈련 기록. 감시 모드는 `fun`으로 봄
+- 유튜브 딴짓 규칙(`r_yt_warn`)의 3번째 조건이 제목 키워드에서 `video_kind not_regex ^(lecture|music|ask)$`로 바뀜 → 딴짓 영상만 걸림. 아직 카테고리를 가져오는 중(NULL)이면 걸리지 않음
+- 실측: HATENA는 업로더가 `People & Blogs`로 올려서 `ask` → 한 번 대답하면 이후 노래로 기억
+
+## 업무·공부 판정 (v5 → 2026-09-27 자동 분류로 변경)
+> **변경:** 시작할 때 "오늘 뭐 할 거야?"로 할 일과 허용 목록을 고르던 방식을 없애고 **자동 분류**로 바꿨다. 스키마는 그대로 — `focus_task`에는 `'자동 분류'` 한 줄만 쓰고, 고양이가 "이것도 공부야?"로 배운 앱·사이트가 그 `allow_item`에 쌓인다 (`learned = 1`). 재생목록·키워드 허용은 쓰지 않는다 (영상은 카테고리로 분류).
+>
+> 판정 순서: 차단 규칙 → 영상 종류(강의·노래) → 이번 실행 대답 → 배운 목록 → **내장 목록**(`FOCUS_APPS/HOSTS`, `DISTRACT_APPS/HOSTS`) → 제목 키워드 → 모름
+
+(아래는 v5 당시 설계 기록)
 **"공부 중"** = 맨 앞 창이 그 할 일의 **허용 목록**에 있고, 20분마다 묻는 **"어디야?"에 대답**하는 상태.
 
 | 판정 (`usage_session.verdict`) | 조건 (위에서부터 먼저) |
@@ -191,7 +213,9 @@ erDiagram
 - "응, 기억해" → `allow_item.learned = 1` + `cat_memory`에 `training` 기록 → 쓸수록 덜 묻는다.
 - `daily_summary`에 `focus_minutes / distract_minutes / unknown_minutes` 추가 → 채찍·당근 점수 재료.
 
-## 고양이 반응 단계 (v4)
+## 고양이 반응 단계 (v4, v7에서 변경)
+> **v7:** 업무모드의 즉시 규칙(`step_sec = 0`, 쇼츠·릴스)은 바로 최대 단계(닫기). 시간 규칙은 `min_minutes` 대신 `step_sec`(초) 단위, 딴짓 영상 10초. 단계(level)는 '오늘 이 규칙의 몇 번째 반응인가'라서 한 칸씩만 오른다. 아래 표는 v4 당시 기록.
+
 `LADDER = warn → mute → delay → close`. 규칙의 `action`은 "여기까지 올라갈 수 있다"는 **최대 단계**다.
 
 | | 쇼츠·릴스 (`min_minutes = 0`) | 유튜브 (`min_minutes = 5`) |
@@ -204,6 +228,7 @@ erDiagram
 - 소리를 끈 뒤 규칙에 안 걸리는 창으로 옮기거나 앱이 끝나면 다시 켠다
 - 유튜브 제외 조건: `window_title not_regex "강의|수업|공부|…|노래|음악|lofi|플레이리스트"` (`watch.py`의 `STUDY_WORDS`)
 - 숏폼 집계(`daily_summary.shorts_seen`, 리포트)는 **즉시 판정 규칙(`min_minutes = 0`)의 발동만** 센다 → 유튜브 N분 알림은 섞이지 않는다
+- 단계·횟수 계산은 `response IS NOT NULL`(v4 이후 기록)만 센다. 옛 기록까지 세면 첫 쇼츠부터 바로 닫는 버그가 있었다 (2026-09-26 수정)
 
 ## 주요 쿼리
 
