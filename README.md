@@ -17,10 +17,15 @@ pip install -r requirements.txt   # 브라우저 주소 읽기용 (없으면 쇼
 ## 실행
 ```powershell
 python cat_app.py --simulate      # 가짜 시나리오로 동작 확인 (아무 OS)
-python cat_app.py                 # 실제 감시 시작, Ctrl+C로 종료
-python cat_app.py --action close  # 규칙이 close면 실제로 창을 닫음 (브라우저는 창 전체가 닫힘 — 주의)
+python cat_app.py                 # 고양이 창이 뜨고 감시 모드로 시작
+python cat_app.py 업무모드         # 업무모드(쇼츠·릴스 탭 차단)로 시작
+```
+켜져 있는 동안 고양이 창에서 **감시 모드 ↔ 업무모드**를 언제든 바꿀 수 있다. 창을 닫으면 종료되고 오늘 통계가 터미널에 나온다.
+```powershell
 python cat_app.py --report        # 오늘 가장 많이 쓴 앱 TOP 5
 ```
+
+> 한 번에 하나만 실행된다. 이미 켜져 있으면 두 번째 실행은 안내 메시지와 함께 종료된다.
 
 ## 테스트
 ```powershell

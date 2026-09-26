@@ -190,6 +190,22 @@ class WindowsProbe:
         """
         return bool(self.user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0))
 
+    VK_CONTROL, VK_W, KEYEVENTF_KEYUP = 0x11, 0x57, 0x0002
+
+    def close_tab(self, hwnd: int) -> bool:
+        """
+        브라우저의 '현재 탭'만 닫는다 — Ctrl+W 키 입력을 흉내낸다.
+        키 입력은 '맨 앞 창'으로 가므로, 그 사이 사용자가 다른 창으로 옮겼다면
+        엉뚱한 탭이 닫힌다. 그래서 보내기 직전에 맨 앞 창이 그대로인지 다시 확인한다.
+        """
+        if self.user32.GetForegroundWindow() != hwnd:
+            return False
+        for vk, flag in ((self.VK_CONTROL, 0), (self.VK_W, 0),
+                         (self.VK_W, self.KEYEVENTF_KEYUP),
+                         (self.VK_CONTROL, self.KEYEVENTF_KEYUP)):
+            self.user32.keybd_event(vk, 0, flag, 0)
+        return True
+
 
 # =============================================================================
 #  OS 의존 부분 2 — 시뮬레이터 (로직 테스트용, 아무 OS에서나 동작)
@@ -229,6 +245,10 @@ class SimulatedProbe:
 
     def close_window(self, hwnd: int) -> bool:
         print(f"      (시뮬레이터: hwnd={hwnd} 에 WM_CLOSE 보냈다고 가정)")
+        return True
+
+    def close_tab(self, hwnd: int) -> bool:
+        print(f"      (시뮬레이터: hwnd={hwnd} 에 Ctrl+W 보냈다고 가정)")
         return True
 
 
