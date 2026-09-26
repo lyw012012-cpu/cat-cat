@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-규칙 엔진 테스트 — python3 test_rules.py
+규칙 엔진 테스트 — python3 tests/test_rules.py
 
 여기서 검증하는 것은 "코드가 돌아가는가"가 아니라
 **설계서의 rule_condition 테이블 구조가 실제로 쓸 만한가** 이다.
@@ -12,7 +12,11 @@
 Windows 없이 어디서나 돌아간다.
 """
 
+import os
+import sys
 import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))   # 상위 폴더의 watch를 찾도록
 
 from watch import (
     Condition,

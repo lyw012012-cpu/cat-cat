@@ -1633,22 +1633,25 @@ def watch_in_background(db_path: str, interval: float, ctl: Control) -> None:
     except ImportError:
         uia_ready = contextlib.nullcontext()
     with uia_ready:
-        db = connect(db_path)
-        if sites_need_refresh(db):
-            threading.Thread(target=download_site_lists, args=(db_path, ctl), daemon=True).start()
+        db = None
         try:
+            db = connect(db_path)                        # 연결 실패도 아래 except가 잡아 고양이에 알린다
+            if sites_need_refresh(db):                   # 공개 사이트 목록은 뒤에서 받는다
+                threading.Thread(target=download_site_lists, args=(db_path, ctl), daemon=True).start()
             run(db, WindowsProbe(), interval, ctl, stop_when_empty=False)
         except Exception as e:                           # noqa: BLE001
             ctl.last = f"⚠ 오류로 멈춤: {type(e).__name__}: {e}"
             print(ctl.last)
             ctl.stop.set()
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
 
 def main() -> int:
     # 한국어 Windows 콘솔(cp949)에서 이모지·특수문자 출력으로 죽지 않게
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 
     ap = argparse.ArgumentParser(description="집사 고양이 v0.1")
     ap.add_argument("--simulate", action="store_true", help="가짜 시나리오 + 메모리 DB")

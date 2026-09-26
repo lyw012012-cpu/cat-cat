@@ -130,8 +130,8 @@ python cat_app.py 업무모드 --test  # 🧪 테스트 모드: 모든 간격을
 
 ## 테스트
 ```powershell
-python test_rules.py   # 규칙 판정 (AND/OR 그룹, 우선순위)
-python test_app.py     # SQLite 저장/조회
+python tests/test_rules.py   # 규칙 판정 (AND/OR 그룹, 우선순위)
+python tests/test_app.py     # SQLite 저장/조회
 ```
 
 ## 구조
