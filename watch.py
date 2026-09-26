@@ -58,6 +58,7 @@ class WindowInfo:
     hwnd: int = 0                   # 창 핸들 (닫을 때 필요)
     pid: int = 0                    # 프로세스 번호 (고양이 앱 자기 창을 알아보는 데 씀)
     video_kind: Optional[str] = None  # 유튜브 영상 종류: lecture/music/fun/ask, 아직 모르면 None
+    verdict: Optional[str] = None   # 고양이 판정: focus/distract/unknown (앱이 채워 넣는다)
 
     @property
     def key(self) -> tuple:
@@ -291,7 +292,7 @@ class SimulatedProbe:
 @dataclass(frozen=True)
 class Condition:
     group_no: int
-    subject: str        # 'app' | 'url' | 'window_title' | 'video_kind'
+    subject: str        # 'app' | 'url' | 'window_title' | 'video_kind' | 'verdict'
     operator: str       # 'eq' | 'contains' | 'regex' | 'not_regex'(이 패턴이 없어야 맞음)
     value: str
 
@@ -313,6 +314,7 @@ def _subject_value(win: WindowInfo, subject: str) -> Optional[str]:
         "url": win.url,
         "window_title": win.title,
         "video_kind": win.video_kind,
+        "verdict": win.verdict,
     }.get(subject)
 
 
@@ -371,14 +373,12 @@ DEFAULT_RULES: tuple[Rule, ...] = (
         ),
     ),
     Rule(
-        rule_id="r_yt_warn", name="유튜브 (공부·음악 제외)", action="close", priority=50,
-        reaction="딴짓 영상 {time}째야.", step_sec=10,
+        rule_id="r_yt_warn", name="딴짓 (영상·사이트)", action="close", priority=50,
+        reaction="딴짓 {time}째야.", step_sec=300,
         conditions=(
-            # group 0 AND group 1 AND group 2 — 크롬이면서, 유튜브이고, 딴짓 영상이어야 한다.
-            # 영상 종류는 YouTube 카테고리로 자동 분류(강의·노래는 제외, 애매하면 사용자에게 물어봄).
-            Condition(0, "app", "eq", "chrome.exe"),
-            Condition(1, "url", "contains", "youtube.com"),
-            Condition(2, "video_kind", "not_regex", "^(lecture|music|ask)$"),
+            # 고양이가 '딴짓'이라고 판정한 창이면 무엇이든 — 딴짓 유튜브 영상, 넷플릭스, 게임, 유튜브 피드·채널 …
+            # (판정은 cat_app.classify: 영상 카테고리 · 내 대답 · 경로 규칙 · 내장 목록 · UT1 도메인 목록)
+            Condition(0, "verdict", "eq", "distract"),
         ),
     ),
 )

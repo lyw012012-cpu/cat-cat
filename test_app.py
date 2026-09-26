@@ -12,6 +12,8 @@ import cat_app
 
 from cat_app import (Control, block, connect, load_rules, run, save_session,
                      single_instance, top_apps_today)
+from dataclasses import replace
+
 from watch import Session, WindowInfo, now_iso, pick_rule
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # 앱처럼 cp949 콘솔에서 이모지 출력 허용
@@ -20,6 +22,14 @@ SHORTS = WindowInfo("웃긴영상 - YouTube - Chrome", "chrome.exe", "https://ww
 NORMAL = WindowInfo("강의 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/watch?v=a")   # 공부 → 제외
 FUN = WindowInfo("웃긴 고양이 - YouTube - Chrome", "chrome.exe", "https://www.youtube.com/watch?v=ffffffffff1",
                  video_kind="fun")
+
+
+def fast_db() -> sqlite3.Connection:
+    """딴짓 단계 간격을 10초로 줄인 메모리 DB (기본 5분은 테스트엔 길다)."""
+    db = connect(":memory:")
+    db.execute("UPDATE block_rule SET step_sec = 10 WHERE rule_id = 'r_yt_warn'")
+    db.commit()
+    return db
 
 
 class RecordingProbe:
@@ -46,7 +56,7 @@ class TestDb(unittest.TestCase):
         """DB에서 읽은 규칙이 스파이크 기본 규칙과 똑같이 판정해야 한다 (AND/OR 그룹 포함)."""
         rules = load_rules(self.db)
         self.assertEqual(pick_rule(rules, SHORTS).rule_id, "r_shorts")
-        self.assertEqual(pick_rule(rules, FUN).rule_id, "r_yt_warn")
+        self.assertEqual(pick_rule(rules, replace(FUN, verdict="distract")).rule_id, "r_yt_warn")
         self.assertIsNone(pick_rule(rules, NORMAL))           # 강의는 not_regex 조건으로 빠짐
 
     def test_default_rules_seeded(self):
@@ -118,7 +128,7 @@ class TestLadder(unittest.TestCase):
         self.assertEqual(probe.calls, ["close"] * 3)                 # 업무모드 첫 쇼츠부터 바로 닫음
 
     def test_fun_video_steps_every_10_seconds(self):
-        db = connect(":memory:")
+        db = fast_db()
         ctl = Control("close")
         probe = RecordingProbe([FUN] * 5 + [WindowInfo("main.py - VS Code", "Code.exe")])
         run(db, probe, 10.0, ctl, True, fetch=lambda vid: "Comedy")
@@ -129,10 +139,10 @@ class TestLadder(unittest.TestCase):
 
     def test_never_skips_a_step(self):
         """이미 35초 본 상태(카테고리를 늦게 알았거나 아까 본 것)여도 첫 반응은 말하기부터 한 칸씩."""
-        db = connect(":memory:")
+        db = fast_db()
         t = now_iso()
         save_session(db, Session(t, "chrome.exe", "예능", "youtube.com/watch?v=aaaaaaaaaaa", 35, False, t),
-                     video_kind="fun")
+                     "distract", video_kind="fun")
         run(db, RecordingProbe([FUN] * 2), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
         self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
                          [(40, "warn"), (50, "mute")])
@@ -155,7 +165,7 @@ class TestTalkAndCounts(unittest.TestCase):
         self.assertEqual(seen, 2)                                                              # 리포트도 2회
 
     def test_cat_warns_what_comes_next(self):
-        rules = {r.rule_id: r for r in load_rules(connect(":memory:"))}
+        rules = {r.rule_id: r for r in load_rules(fast_db())}
         H = cat_app.heads_up
         self.assertEqual(H(rules["r_shorts"], 0, "close", 0), "업무 중엔 쇼츠 금지야.")
         self.assertEqual(H(rules["r_shorts"], 0, "log", 0), "60분 더 보면 소리 안 들리게 할 거야.")
@@ -190,7 +200,6 @@ class TestTalkAndCounts(unittest.TestCase):
         """고양이 창(오늘 뭐 할 거야? 등)에 대답하는 시간은 모름으로 세지 않고, 묻지도 않는다."""
         db = connect(":memory:")
         ctl = Control("close")
-        ctl.task_id = cat_app.get_or_create_task(db, "파이썬 강의")
         own = WindowInfo("오늘 뭐 할 거야?", "python.exe", pid=os.getpid())
         run(db, RecordingProbe([own] * 10), 10.0, ctl, True)
         self.assertTrue(ctl.ui_requests.empty())
@@ -269,17 +278,137 @@ class TestVideoKind(unittest.TestCase):
                          ("Entertainment", "lecture"))
 
 
+class TestWeb(unittest.TestCase):
+    """인터넷 전체 자동 분류: ③ 내 대답 > ④ 경로 규칙 > ② 내장 목록 > ① 공개 도메인 목록(UT1)."""
+
+    def test_layer_priority(self):
+        rules = load_rules(connect(":memory:"))
+        C = lambda url, sites: cat_app.classify(WindowInfo("t", "chrome.exe", url), rules, sites, {})
+        self.assertEqual(C("github.com/x", {"github.com": ("distract", "user")}), "distract")        # 내 대답 > 내장
+        self.assertEqual(C("github.com/x", {"github.com": ("distract", "ut1:games")}), "focus")      # 내장 > UT1
+        self.assertEqual(C("play.somegame.com/lobby", {"somegame.com": ("distract", "ut1:games")}), "distract")  # 상위 도메인
+        self.assertEqual(C("youtube.com/@nara.asmr./videos", {}), "distract")                      # 경로 규칙
+        self.assertEqual(C("youtube.com/results?search_query=파이썬", {}), "unknown")               # 검색은 모름
+        self.assertEqual(C("comic.naver.com/webtoon", {}), "distract")                              # 한국 사이트 내장
+
+    def test_update_lists_keeps_my_answers(self):
+        db = connect(":memory:")
+        cat_app.save_site(db, "reddit.com", "focus")                         # 나는 레딧을 공부로 쓴다고 답함
+        fake = {cat_app.UT1_URL.format(c): "# comment\nreddit.com\nsomegame.com\n" for c in cat_app.UT1_DISTRACT}
+        n = cat_app.update_site_lists(db, fetch_text=fake.__getitem__)
+        self.assertEqual(n, 2 * len(cat_app.UT1_DISTRACT))
+        sites = cat_app.load_site_kinds(db)
+        self.assertEqual(sites["reddit.com"], ("focus", "user"))              # 내 대답은 덮어쓰지 않음
+        self.assertEqual(sites["somegame.com"][0], "distract")
+
+    def test_distract_site_steps_every_10_seconds(self):
+        """넷플릭스처럼 딴짓 사이트도 업무모드면 유튜브 딴짓 영상과 같은 10초 단계."""
+        db = fast_db()
+        ctl = Control("close")
+        probe = RecordingProbe([WindowInfo("넷플릭스", "msedge.exe", "netflix.com/browse")] * 4)
+        run(db, probe, 10.0, ctl, True)
+        self.assertEqual(db.execute("SELECT response FROM block_event ORDER BY event_id").fetchall(),
+                         [("warn",), ("mute",), ("delay",), ("close",)])
+        self.assertEqual(probe.calls, ["mute", "close", "unmute"])      # 끝나면 소리를 돌려줌
+        self.assertEqual(db.execute("SELECT seconds FROM block_event").fetchall(), [(10,), (20,), (30,), (40,)])
+
+    def test_no_distract_answer_is_remembered(self):
+        """'아니, 딴짓' 대답은 앱을 다시 켜도 기억한다."""
+        db = connect(":memory:")
+        cat_app.save_site(db, "someblog.net", "distract")
+        ctl = Control("log")
+        run(db, RecordingProbe([WindowInfo("블로그", "chrome.exe", "someblog.net/post")] * 3), 10.0, ctl, True)
+        self.assertEqual(db.execute("SELECT DISTINCT verdict FROM usage_session").fetchall(), [("distract",)])
+
+
+class TestV9(unittest.TestCase):
+    """배운 것 되돌리기 · 채찍·당근 · 확인 메모 · 자동 백업 · 목록 갱신 주기."""
+
+    def test_forget_learned_answers(self):
+        db = connect(":memory:")
+        cat_app.save_site(db, "someblog.net", "distract")
+        cat_app.save_video(db, "yyyyyyyyyyy", category="People & Blogs", user_label="lecture", title="ASMR 위로샵")
+        self.assertEqual({(w, n, k) for w, _, n, k in cat_app.learned(db)},
+                         {("site", "someblog.net", "distract"), ("video", "ASMR 위로샵", "lecture")})
+        cat_app.forget(db, "site", "someblog.net")
+        cat_app.forget(db, "video", "yyyyyyyyyyy")
+        self.assertEqual(cat_app.learned(db), [])
+        self.assertEqual(db.execute("SELECT category FROM video_info").fetchone(), ("People & Blogs",))  # 카테고리는 남김
+
+    def add_day(self, db, n, focus, distract, shorts=0):
+        t = days_ago(n)
+        db.execute("INSERT INTO usage_session (started_at, exe, duration_sec, is_idle, verdict) VALUES (?, 'Code.exe', ?, 0, 'focus')",
+                   (t, focus * 60))
+        db.execute("INSERT INTO usage_session (started_at, exe, duration_sec, is_idle, verdict) VALUES (?, 'chrome.exe', ?, 0, 'distract')",
+                   (t, distract * 60))
+        for _ in range(shorts):
+            db.execute("INSERT INTO block_event (occurred_at, rule_id, action, response, executed)"
+                       " VALUES (?, 'r_shorts', 'close', 'close', 1)", (t,))
+        db.commit()
+
+    def test_carrot_and_stick(self):
+        db = connect(":memory:")
+        for n in (4, 3, 2):
+            self.add_day(db, n, focus=40, distract=10)                     # 평소: 집중 40 · 딴짓 10
+        self.add_day(db, 1, focus=70, distract=40, shorts=3)                # 어제: 집중↑ 딴짓↑ 숏폼 3
+        cat_app.summarize_and_prune(db)
+        yesterday = db.execute("SELECT MAX(day) FROM daily_summary").fetchone()[0]
+        rows = db.execute("SELECT kind, reason, points FROM cat_memory WHERE day = ? ORDER BY memory_id",
+                          (yesterday,)).fetchall()
+        self.assertEqual([(k, p) for k, _, p in rows],
+                         [("carrot", 5), ("carrot", 5), ("stick", -5), ("stick", -5), ("stick", -6), ("training", 0)])
+        self.assertIn("평소(40분)보다 30분 더 집중", [r for _, r, _ in rows])
+        cat_app.summarize_and_prune(db)                                     # 두 번 돌려도 점수는 한 번만
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM cat_memory WHERE kind = 'carrot'").fetchone()[0], 8)   # 나흘 × 당근 2개
+        self.assertIn("점수 -6", cat_app.score_text(db))                    # 5+5-5-5-6
+
+    def test_checkin_notes_shown(self):
+        db = connect(":memory:")
+        db.execute("INSERT INTO focus_checkin (asked_at, answered_at, answer, note) VALUES (?, ?, 'focus', '중급 14강까지')",
+                   (now_iso(), now_iso()))
+        db.execute("INSERT INTO focus_checkin (asked_at) VALUES (?)", (now_iso(),))
+        text = cat_app.checkins_text(db)
+        self.assertIn("📚 하는 중 — 중급 14강까지", text)
+        self.assertIn("💤 대답 없음", text)
+
+    def test_backup_before_upgrade_keeps_two(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "cat.db")
+        for v in (5, 6, 7):                                                 # 예전 백업이 이미 여러 개
+            open(os.path.join(d, f"cat.backup-v{v}.db"), "w").close()
+            os.utime(os.path.join(d, f"cat.backup-v{v}.db"), (v, v))
+        old = sqlite3.connect(path)
+        old.executescript(cat_app.SCHEMA)
+        old.execute("PRAGMA user_version = 8")
+        old.close()
+        try:
+            connect(path).close()
+        except sqlite3.OperationalError:
+            pass                                                            # v0 모양이라 v9 정리는 실패해도 백업은 먼저
+        backups = sorted(f for f in os.listdir(d) if f.startswith("cat.backup-"))
+        self.assertEqual(len(backups), 2)
+        self.assertIn("cat.backup-v8.db", backups)
+
+    def test_site_lists_refresh_monthly(self):
+        db = connect(":memory:")
+        self.assertTrue(cat_app.sites_need_refresh(db))                     # 한 번도 안 받음
+        db.execute("INSERT INTO site_kind VALUES ('game.com', 'distract', 'ut1:games', ?)", (now_iso(),))
+        self.assertFalse(cat_app.sites_need_refresh(db))
+        db.execute("UPDATE site_kind SET updated_at = '2020-01-01T00:00:00Z'")
+        self.assertTrue(cat_app.sites_need_refresh(db))
+
+
 class TestTimedRule(unittest.TestCase):
     """딴짓 영상은 오늘 누적 10초 구간마다 한 번 반응한다 (강의·노래 시간은 안 셈)."""
 
     def run_on(self, fun_minutes, mode, study_minutes=0):
-        db = connect(":memory:")
+        db = fast_db()
         t = now_iso()
         save_session(db, Session(t, "chrome.exe", "예능 - YouTube", "youtube.com/watch?v=aaaaaaaaaaa",
-                                 fun_minutes * 60, False, t), video_kind="fun")
+                                 fun_minutes * 60, False, t), "distract", video_kind="fun")
         if study_minutes:
             save_session(db, Session(t, "chrome.exe", "파이썬 강의 - YouTube", "youtube.com/watch?v=sssssssssss",
-                                     study_minutes * 60, False, t), video_kind="lecture")
+                                     study_minutes * 60, False, t), "focus", video_kind="lecture")
         probe = RecordingProbe([FUN] * 3)
         ctl = Control(mode)
         run(db, probe, 0.0, ctl, stop_when_empty=True, fetch=lambda vid: "Comedy")
@@ -288,7 +417,7 @@ class TestTimedRule(unittest.TestCase):
     def test_once_per_step_in_watch_mode(self):
         db, probe, ctl = self.run_on(30.5, "log")
         self.assertEqual(db.execute("SELECT seconds, response FROM block_event").fetchall(), [(1830, "warn")])
-        self.assertIn("딴짓 영상 30분 30초째야", ctl.last)
+        self.assertIn("딴짓 30분 30초째야", ctl.last)
 
     def test_study_time_is_not_counted(self):
         db, _, _ = self.run_on(7, "log", study_minutes=50)          # 공부 50분은 세지 않음 → 딴짓 7분만
@@ -324,13 +453,16 @@ class TestSessionsAndMigration(unittest.TestCase):
         self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], len(cat_app.MIGRATIONS))
         self.assertEqual(db.execute("SELECT duration_sec FROM usage_session").fetchall(), [(5.0,)])
         self.assertEqual(db.execute("SELECT reaction, step_sec, action FROM block_rule").fetchone(),
-                         ("딴짓 영상 {time}째야.", 10, "close"))                # v7: 10초마다
-        self.assertEqual(db.execute("SELECT operator FROM rule_condition WHERE rule_id = 'r_yt_warn'").fetchall(),
-                         [("not_regex",)])                     # v4: 강의·노래 제외 조건이 붙음
+                         ("딴짓 {time}째야.", 300, "close"))                    # v9: 테스트 값 10초 → 5분
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        self.assertTrue({"focus_task", "allow_item", "focus_checkin", "video_info"} <= tables)   # v5, v6
-        self.assertEqual(db.execute("SELECT subject, value FROM rule_condition WHERE rule_id = 'r_yt_warn'").fetchall(),
-                         [("video_kind", "^(lecture|music|ask)$")])             # v6: 제목 대신 영상 종류
+        self.assertFalse({"focus_task", "allow_item"} & tables)                  # v9: 안 쓰는 테이블 정리
+        cols = {r[1] for r in db.execute("PRAGMA table_info(usage_session)")}
+        self.assertNotIn("task_id", cols)
+        self.assertEqual(db.execute("SELECT subject, operator, value FROM rule_condition WHERE rule_id = 'r_yt_warn'")
+                         .fetchall(), [("verdict", "eq", "distract")])     # v8: 딴짓 판정이면 무엇이든
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertTrue({"focus_checkin", "video_info", "site_kind", "cat_memory"} <= tables)   # v5·v6·v8 (v9에서 focus_task·allow_item 제거)
+        self.assertIn("site_kind", {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")})
         db.close()
         connect(path).close()                                  # 두 번 열어도 다시 적용되지 않음
 
@@ -390,11 +522,6 @@ class TestMemoryAndRetention(unittest.TestCase):
 class TestFocus(unittest.TestCase):
     """오늘 뭐 할 거야? — 허용 목록, 모르는 창 묻기, 20분마다 어디야?"""
 
-    def test_host_allows_whole_site(self):
-        items = [("host", "python.org")]
-        self.assertTrue(cat_app.is_allowed(WindowInfo("t", "chrome.exe", "docs.python.org/3/library/re.html"), items))
-        self.assertFalse(cat_app.is_allowed(WindowInfo("t", "chrome.exe", "notpython.org/x"), items))
-
     def test_builtin_auto_classification(self):
         """할 일을 고르지 않아도 흔한 공부·업무 앱/사이트와 딴짓 사이트는 자동으로 나뉜다."""
         B = cat_app.builtin_kind
@@ -411,10 +538,10 @@ class TestFocus(unittest.TestCase):
     def test_classify_order(self):
         rules = load_rules(connect(":memory:"))
         so = WindowInfo("질문", "chrome.exe", "someblog.net/q/1")
-        self.assertEqual(cat_app.classify(SHORTS, rules, [("host", "youtube.com")], {}), "distract")  # 규칙이 먼저
-        self.assertEqual(cat_app.classify(so, rules, [], {}), "unknown")
-        self.assertEqual(cat_app.classify(so, rules, [], {("host", "someblog.net"): "focus"}), "focus")
-        self.assertEqual(cat_app.classify(so, rules, [("host", "someblog.net")], {}), "focus")
+        self.assertEqual(cat_app.classify(SHORTS, rules, {"youtube.com": ("focus", "user")}, {}), "distract")  # 쇼츠 규칙이 먼저
+        self.assertEqual(cat_app.classify(so, rules, {}, {}), "unknown")
+        self.assertEqual(cat_app.classify(so, rules, {}, {("host", "someblog.net"): "focus"}), "focus")
+        self.assertEqual(cat_app.classify(so, rules, {"someblog.net": ("focus", "user")}, {}), "focus")
 
     def test_ask_unknown_then_checkin_then_away(self):
         """할 일을 고르지 않아도: 모르는 사이트 30초 → 묻기, 공부 앱 20분 → 어디야?, 무응답 3분 → 자리 비움."""
@@ -432,13 +559,10 @@ class TestFocus(unittest.TestCase):
         self.assertEqual(reqs, [("unknown", ("host", "someblog.net"), so.title), ("checkin",)])
         verdicts = db.execute("SELECT exe, verdict FROM usage_session ORDER BY session_id").fetchall()
         self.assertEqual(verdicts, [("chrome.exe", "unknown"), ("Code.exe", "focus"), ("Code.exe", "away")])
-        self.assertEqual(ctl.task_id, cat_app.get_or_create_task(db, cat_app.AUTO_TASK))   # 배운 건 '자동 분류' 한 목록에
 
     def test_watch_mode_never_asks(self):
         db = connect(":memory:")
         ctl = Control("log")
-        ctl.task_id = cat_app.get_or_create_task(db, "파이썬 강의")    # 할 일이 남아 있어도 감시 모드면 안 묻는다
-        ctl.allow_items = [("app", "Code.exe")]
         frames = [WindowInfo("질문", "chrome.exe", "stackoverflow.com/q/1")] * 10 \
             + [WindowInfo("main.py", "Code.exe")] * 130
         run(db, RecordingProbe(frames), 10.0, ctl, True)
@@ -448,8 +572,6 @@ class TestFocus(unittest.TestCase):
         """'어디야?'를 기다리는 중에 감시 모드로 바꾸면 자리 비움으로 세지 않는다."""
         db = connect(":memory:")
         ctl = Control("close")
-        ctl.task_id = cat_app.get_or_create_task(db, "파이썬 강의")
-        ctl.allow_items = [("app", "Code.exe")]
         code = WindowInfo("main.py", "Code.exe")
         switch = lambda left: setattr(ctl, "action", "log") if left == 20 else None   # 확인 직후 감시 모드로
         run(db, RecordingProbe([code] * 140, on_frame=switch), 10.0, ctl, True)

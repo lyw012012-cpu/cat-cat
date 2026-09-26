@@ -105,13 +105,12 @@ class TestPriority(unittest.TestCase):
         """제목에 '강의'가 있으면 공부 용도 → 유튜브 시간 규칙에서 빠진다 (not_regex)."""
         self.assertIsNone(pick_rule(DEFAULT_RULES, NORMAL_VIDEO))
 
-    def test_fun_video_is_caught_by_youtube_rule(self):
-        """유튜브 규칙은 영상 종류(YouTube 카테고리로 분류)를 본다: 딴짓만 걸리고 강의·노래·애매함은 안 걸림."""
-        url = "https://www.youtube.com/watch?v=zzzzzzzzzzz"
-        kinds = {k: pick_rule(DEFAULT_RULES, WindowInfo("HATENA - YouTube - Chrome", "chrome.exe", url, video_kind=k))
-                 for k in ("fun", "music", "lecture", "ask", None)}
-        self.assertEqual(kinds["fun"].rule_id, "r_yt_warn")
-        self.assertEqual([k for k, r in kinds.items() if r], ["fun"])
+    def test_distract_rule_follows_the_verdict(self):
+        """딴짓 규칙은 고양이 판정(verdict)을 본다: 딴짓으로 판정된 창이면 영상이든 사이트든 앱이든 걸린다."""
+        hits = {v: pick_rule(DEFAULT_RULES, WindowInfo("넷플릭스", "msedge.exe", "netflix.com/browse", verdict=v))
+                for v in ("distract", "focus", "unknown", None)}
+        self.assertEqual(hits["distract"].rule_id, "r_yt_warn")         # 크롬이 아니어도(엣지) 걸림
+        self.assertEqual([v for v, r in hits.items() if r], ["distract"])
 
     def test_no_rule_for_editor(self):
         self.assertIsNone(pick_rule(DEFAULT_RULES, VSCODE))

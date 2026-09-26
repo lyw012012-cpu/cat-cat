@@ -1,4 +1,4 @@
-> 고양이 앱 DB는 테이블 10개 (스키마 v7). **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
+> 고양이 앱 DB는 테이블 9개 (스키마 v9). 정리된 ERD는 위키 [[고양이-앱-db-erd]]. 이 문서는 설계 이유와 변경 이력. **원본 기록 2개는 90일 보관**, **고양이 기억 2개(하루 요약, 채찍·당근·훈련)는 영구 보관**. **규칙 2개**(block_rule, rule_condition) + **기록 2개**(usage_session, block_event). 핵심은 `group_no`로 AND/OR를 표현하는 조건 테이블.
 
 - 코드: `cat_app.py`의 `SCHEMA` · DB 파일: `%LOCALAPPDATA%\cat-app\cat.db` (개인정보라 OneDrive·git 밖 PC 로컬에 둠)
 - 관련: [[진행도]] · [[고양이-생산성-앱-프로젝트]] · [[프로젝트 일정]]
@@ -10,47 +10,86 @@
 erDiagram
     block_rule ||--o{ rule_condition : "조건 (CASCADE)"
     block_rule ||--o{ block_event : "발동 기록 (SET NULL)"
-    usage_session }o..|| daily_summary : "하루가 끝나면 요약 (90일 뒤 원본 삭제)"
-    block_event }o..|| daily_summary : "숏폼 감지·닫은 횟수 요약"
+    usage_session }o..|| daily_summary : "하루 끝나면 요약, 90일 뒤 원본 삭제"
+    block_event }o..|| daily_summary : "숏폼 감지·닫은 횟수"
+    daily_summary ||..o{ cat_memory : "채찍·당근 점수"
+    focus_checkin }o..o{ cat_memory : "어디야? 대답 점수"
+    site_kind ||..o{ usage_session : "사이트·앱 판정"
+    video_info ||..o{ usage_session : "영상 종류"
 
+    block_rule {
+        TEXT rule_id PK "r_shorts, r_reels, r_yt_warn"
+        TEXT name
+        TEXT action "최대 단계 warn<mute<delay<close"
+        INTEGER priority "작을수록 우선"
+        TEXT reaction "고양이 대사 ({time})"
+        INTEGER enabled "0/1"
+        INTEGER step_sec "0=즉시, N=누적 N초마다 한 단계"
+    }
+    rule_condition {
+        INTEGER condition_id PK
+        TEXT rule_id FK
+        INTEGER group_no "같으면 OR, 다르면 AND"
+        TEXT subject "app/url/window_title/video_kind/verdict"
+        TEXT operator "eq/contains/regex/not_regex"
+        TEXT value
+    }
+    usage_session {
+        INTEGER session_id PK
+        TEXT started_at "UTC, 인덱스"
+        TEXT ended_at
+        TEXT exe
+        TEXT window_title
+        TEXT url_host
+        TEXT url
+        REAL duration_sec
+        INTEGER is_idle "0/1"
+        TEXT verdict "focus/distract/unknown/away"
+        TEXT video_kind "lecture/music/fun/ask"
+    }
+    block_event {
+        INTEGER event_id PK
+        TEXT occurred_at "UTC, 인덱스"
+        TEXT rule_id FK
+        TEXT action "규칙의 최대 단계"
+        TEXT exe
+        TEXT url_host
+        TEXT mode "log(감시)/close(업무)"
+        TEXT response "실제 행동"
+        INTEGER executed "성공 1/0"
+        INTEGER seconds "누적 시간 규칙이면 그때 초"
+    }
+    focus_checkin {
+        INTEGER checkin_id PK
+        TEXT asked_at "인덱스"
+        TEXT answered_at "NULL=대답 없음"
+        TEXT answer "focus/break"
+        TEXT note "어디까지 했어?"
+    }
+    site_kind {
+        TEXT key PK "도메인 또는 앱(소문자)"
+        TEXT kind "focus/distract"
+        TEXT source "user / ut1:games …"
+        TEXT updated_at
+    }
+    video_info {
+        TEXT video_id PK "watch?v= 11자"
+        TEXT category "YouTube 카테고리"
+        TEXT user_label "lecture/music/fun"
+        TEXT title
+        TEXT fetched_at
+    }
     daily_summary {
         TEXT day PK "현지 날짜"
         TEXT exe PK
-        TEXT url_host PK "'' = 웹 아님"
+        TEXT url_host PK "''=웹 아님"
         REAL minutes
         INTEGER sessions
         INTEGER shorts_seen
         INTEGER shorts_closed
-    }
-    focus_task ||--o{ allow_item : "허용 목록 (CASCADE)"
-    focus_task ||--o{ focus_checkin : "어디야? 확인"
-    focus_task ||--o{ usage_session : "그때 할 일"
-
-    focus_task {
-        INTEGER task_id PK
-        TEXT name UK "파이썬 강의"
-        TEXT created_at
-    }
-    allow_item {
-        INTEGER item_id PK
-        INTEGER task_id FK
-        TEXT kind "app/host/playlist/keyword"
-        TEXT value
-        INTEGER learned "1=고양이가 물어보고 배움"
-    }
-    focus_checkin {
-        INTEGER checkin_id PK
-        INTEGER task_id FK
-        TEXT asked_at
-        TEXT answered_at "NULL=대답 안 함"
-        TEXT answer "focus/break"
-        TEXT note "어디까지 했어?"
-    }
-    video_info {
-        TEXT video_id PK "watch?v= 11자"
-        TEXT category "YouTube 카테고리, ''=못 읽음"
-        TEXT user_label "lecture/music/fun"
-        TEXT fetched_at
+        REAL focus_minutes
+        REAL distract_minutes
+        REAL unknown_minutes
     }
     cat_memory {
         INTEGER memory_id PK
@@ -60,55 +99,10 @@ erDiagram
         INTEGER points "당근 +, 채찍 -"
         TEXT created_at
     }
-
-    block_rule {
-        TEXT rule_id PK "예: r_shorts"
-        TEXT name
-        TEXT action "최대 단계: warn<mute<delay<close"
-        INTEGER priority "작을수록 우선"
-        TEXT reaction "고양이 대사"
-        INTEGER enabled "0/1"
-        INTEGER min_minutes "v1: 0=즉시, N=오늘 누적 N분마다"
-    }
-    rule_condition {
-        INTEGER condition_id PK
-        TEXT rule_id FK
-        INTEGER group_no "같으면 OR, 다르면 AND"
-        TEXT subject "app/url/window_title"
-        TEXT operator "eq/contains/regex/not_regex(v4)"
-        TEXT value
-    }
-    block_event {
-        INTEGER event_id PK
-        TEXT occurred_at "UTC"
-        TEXT rule_id FK
-        TEXT action
-        TEXT exe
-        TEXT url_host
-        TEXT mode "v1: log(감시)/close(업무)"
-        TEXT response "v4: 실제 행동 warn/mute/delay/close"
-        INTEGER executed "v1: 그 행동이 성공했나 1/0"
-        INTEGER minutes "v1: 누적 시간 규칙이면 그때 분"
-    }
-    usage_session {
-        INTEGER session_id PK
-        TEXT started_at "UTC, 인덱스"
-        TEXT ended_at
-        TEXT exe
-        TEXT window_title "로컬 전용 (영상 제목 등)"
-        TEXT url_host "집계용"
-        TEXT url "v1: 전체 주소 (쇼츠/강의 구분)"
-        TEXT verdict "v5: focus/distract/unknown/away"
-        TEXT video_kind "v6: lecture/music/fun/ask"
-        INTEGER task_id FK "v5: 그때 할 일"
-        REAL duration_sec
-        INTEGER is_idle "0/1"
-    }
 ```
 
-- `block_rule` 1 : N `rule_condition`: 규칙 하나에 조건 여러 개
-- `block_rule` 1 : N `block_event`: 규칙 하나가 여러 번 발동
-- `usage_session`: 독립 로그 (관계 없음)
+- 실선 = 외래키 관계 (`block_rule` 1:N `rule_condition`, `block_rule` 1:N `block_event`), 점선 = 값으로 이어지는 흐름 (요약·판정·점수)
+- v9에서 `focus_task`·`allow_item`, `usage_session.task_id`, `block_rule.min_minutes`, `block_event.minutes` 제거 — 아래 v5·v7 설명에 나오는 것은 당시 기록
 
 ## 테이블별 설계 이유
 
@@ -160,6 +154,8 @@ erDiagram
 | 버전 | 내용 |
 |---|---|
 | v0 | 테이블 4개 (최초) |
+| v9 (2026-09-27) | 정리: 딴짓 단계 10초(테스트 값) → **5분** · `focus_task`·`allow_item` 삭제 · `usage_session`·`focus_checkin`에서 `task_id` 제거(FK라 재생성) · `min_minutes`·`block_event.minutes` DROP · `video_info.title` 추가 · `focus_checkin` 인덱스 · **업그레이드 전 자동 백업**(최근 2개) · 채찍·당근 점수(`score_day`) · UT1 30일마다 갱신 |
+| v8 (2026-09-27) | `site_kind` 추가(내 대답 + UT1 공개 목록) · 딴짓 규칙을 `verdict = 'distract'`로 일반화 · `rule_condition.subject`에 `verdict` · 백업 `cat.backup-v7.db` |
 | v7 (2026-09-27) | 단계 간격 분 → 초: `block_rule.step_sec` 추가 (딴짓 영상 **10초마다**), `block_event.seconds` 추가 · 업무모드 쇼츠는 첫 번째부터 바로 닫기(코드) · 단계는 한 번에 한 칸씩(오늘 몇 번째 반응인가) · 백업 `cat.backup-v6.db` |
 | v6 (2026-09-26) | `video_info` 추가 · `usage_session.video_kind` · `rule_condition.subject`에 `video_kind` 추가 (CHECK 변경이라 재생성) · 유튜브 규칙이 제목 대신 영상 종류를 봄 · 백업 `cat.backup-v5.db` |
 | v5 (2026-09-26) | `focus_task`, `allow_item`, `focus_checkin` 추가 · `usage_session.verdict/task_id` · `daily_summary` 집중·딴짓·모름 분 · 백업 `cat.backup-v4.db` |
@@ -183,6 +179,30 @@ erDiagram
 `url_host`에 NULL 대신 `''`를 쓰는 이유: 기본키(PK) 컬럼은 NULL이면 중복 판정이 안 된다.
 
 **훈련 기억 아이디어:** `daily_summary`로 최근 7일 평균 유튜브 분을 계산 → 오늘이 평균보다 적으면 🥕, 많으면 🪓 → 결과를 `cat_memory`에 남김. (점수 규칙은 추후 결정)
+
+## 채찍·당근과 배운 것 (v9)
+- **점수 (`score_day`)** — 하루가 요약될 때(다음 날 처음 켤 때) 그날 점수를 `cat_memory`에 쓴다. 시작용 기본값:
+  | | 조건 | 점수 |
+  |---|---|---|
+  | 🥕 | 집중 30분 이상 / 평소보다 더 집중 / 숏폼 0회 / "어디야?" 모두 대답 | +5 / +5 / +3 / +2 |
+  | 🪓 | 딴짓 30분 이상 / 평소보다 딴짓 20%↑(10분 이상) / 숏폼 1회당 / "어디야?" 무응답 1회당 | -5 / -5 / -2(최대 -10) / -1 |
+  | 🧠 | 평소 = 최근 7일 평균 집중·딴짓 분 | 0 |
+- **배운 것 (`learned`, `forget`)** — 고양이 창 "🧠 배운 것"에서 내 대답(사이트·영상)을 보고 지운다 → 다음에 다시 물어봄
+- **오늘 한 일** — 판정별 무엇을 했나 + "어디야?" 대답과 메모 + 최근 채찍·당근
+
+## 인터넷 전체 자동 분류 (v8)
+`classify()` 판정 순서: 쇼츠 규칙 → 유튜브 영상 종류 → 이번 실행 대답 → **③ `site_kind`(source='user')** → **④ `PATH_RULES`** → **② 내장 목록** → **① `site_kind`(source='ut1:…')** → 제목 키워드 → 모름
+
+| 층 | 저장 위치 | 내용 |
+|---|---|---|
+| ① 공개 목록 | `site_kind` (ut1:분류) | UT1 딴짓 8개 분류 약 12.5만 도메인. 처음 켤 때 뒤에서 받음, `--update-sites`로 갱신. **user 행은 덮어쓰지 않음** (`ON CONFLICT … WHERE source != 'user'`) |
+| ② 내장 목록 | 코드 (`FOCUS_*`, `DISTRACT_*`) | UT1에 빈 곳이 많은 한국 사이트 보강 |
+| ③ 내 대답 | `site_kind` (user) | "응, 기억해" → focus, "아니, 딴짓" → distract. 둘 다 영구 (v8 전에는 딴짓 대답은 메모리에만) |
+| ④ 경로 규칙 | 코드 (`PATH_RULES`) | 유튜브 홈·채널·구독·재생목록 페이지 → distract. 호스트는 정확히 일치 (music.youtube.com 제외) |
+
+- 도메인은 가장 구체적인 것부터 찾는다 (`play.game.com` → `game.com`).
+- 딴짓 규칙(`r_yt_warn`, 이름 '딴짓 (영상·사이트)')의 조건이 `verdict = 'distract'` 하나로 바뀜 → **판정이 딴짓인 모든 창**에 10초 단계. 크롬 전용 조건도 사라짐. `rule_condition.subject`에 `verdict` 추가 (CHECK 변경이라 재생성)
+- `allow_item`/`focus_task`는 더 쓰지 않음 (배운 앱·사이트는 v8에서 `site_kind`로 옮김)
 
 ## 유튜브 영상 종류 (v6)
 `video_kind` = **사용자 대답 > YouTube 카테고리 > 제목 키워드** 순서로 정한다 (`video_kind()`).

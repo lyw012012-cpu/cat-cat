@@ -206,7 +206,80 @@ MIGRATIONS = [
         WHERE rule_id = 'r_yt_warn' AND min_minutes = 5;
     ALTER TABLE block_event ADD COLUMN seconds INTEGER;    -- 누적 시간 규칙이면 그때 누적 초 (minutes 대신)
     """,
+    # v8: 인터넷 전체 자동 분류 — 사이트·앱 판정 저장소(site_kind) + 딴짓 규칙을 '판정이 딴짓인 모든 창'으로
+    """
+    CREATE TABLE site_kind (
+        key        TEXT PRIMARY KEY,                     -- 도메인(netflix.com) 또는 앱(code.exe), 소문자
+        kind       TEXT NOT NULL CHECK (kind IN ('focus', 'distract')),
+        source     TEXT NOT NULL,                        -- 'user'(물어보고 배움) | 'ut1:games' 같은 공개 목록
+        updated_at TEXT NOT NULL
+    );
+    INSERT OR IGNORE INTO site_kind (key, kind, source, updated_at)
+        SELECT lower(value), 'focus', 'user', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        FROM allow_item WHERE kind IN ('app', 'host');
+    CREATE TABLE rule_condition_v8 (
+        condition_id INTEGER PRIMARY KEY,
+        rule_id      TEXT NOT NULL REFERENCES block_rule(rule_id) ON DELETE CASCADE,
+        group_no     INTEGER NOT NULL DEFAULT 0,
+        subject      TEXT NOT NULL CHECK (subject IN ('app', 'url', 'window_title', 'video_kind', 'verdict')),
+        operator     TEXT NOT NULL CHECK (operator IN ('eq', 'contains', 'regex', 'not_regex')),
+        value        TEXT NOT NULL
+    );
+    INSERT INTO rule_condition_v8 SELECT * FROM rule_condition;
+    DROP TABLE rule_condition;
+    ALTER TABLE rule_condition_v8 RENAME TO rule_condition;
+    DELETE FROM rule_condition WHERE rule_id = 'r_yt_warn';
+    INSERT INTO rule_condition (rule_id, group_no, subject, operator, value)
+        SELECT 'r_yt_warn', 0, 'verdict', 'eq', 'distract'
+        WHERE EXISTS (SELECT 1 FROM block_rule WHERE rule_id = 'r_yt_warn');
+    UPDATE block_rule SET name = '딴짓 (영상·사이트)', reaction = '딴짓 {time}째야.' WHERE rule_id = 'r_yt_warn';
+    """,
+    # v9: 정리 — 테스트 값(10초)을 5분으로, 더 안 쓰는 테이블·컬럼 제거, 배운 영상에 제목, 확인 기록 인덱스
+    #     FK가 걸린 컬럼(task_id)은 DROP COLUMN이 안 돼서 usage_session·focus_checkin 은 새로 만들어 옮긴다.
+    """
+    UPDATE block_rule SET step_sec = 300 WHERE rule_id = 'r_yt_warn' AND step_sec = 10;
+    ALTER TABLE block_rule  DROP COLUMN min_minutes;
+    ALTER TABLE block_event DROP COLUMN minutes;
+    ALTER TABLE video_info  ADD COLUMN title TEXT;           -- "이거 강의 맞아?" 대답할 때의 제목 (배운 것 목록에 표시)
+
+    CREATE TABLE usage_session_v9 (
+        session_id   INTEGER PRIMARY KEY,
+        started_at   TEXT NOT NULL,
+        ended_at     TEXT,
+        exe          TEXT NOT NULL,
+        window_title TEXT,
+        url_host     TEXT,
+        url          TEXT,
+        duration_sec REAL NOT NULL,
+        is_idle      INTEGER NOT NULL CHECK (is_idle IN (0, 1)),
+        verdict      TEXT,
+        video_kind   TEXT
+    );
+    INSERT INTO usage_session_v9 SELECT session_id, started_at, ended_at, exe, window_title, url_host, url,
+                                        duration_sec, is_idle, verdict, video_kind FROM usage_session;
+    DROP TABLE usage_session;
+    ALTER TABLE usage_session_v9 RENAME TO usage_session;
+    CREATE INDEX ix_session_started ON usage_session(started_at);
+
+    CREATE TABLE focus_checkin_v9 (
+        checkin_id  INTEGER PRIMARY KEY,
+        asked_at    TEXT NOT NULL,
+        answered_at TEXT,
+        answer      TEXT CHECK (answer IN ('focus', 'break')),
+        note        TEXT
+    );
+    INSERT INTO focus_checkin_v9 SELECT checkin_id, asked_at, answered_at, answer, note FROM focus_checkin;
+    DROP TABLE focus_checkin;
+    ALTER TABLE focus_checkin_v9 RENAME TO focus_checkin;
+    CREATE INDEX ix_checkin_asked ON focus_checkin(asked_at);
+
+    DROP TABLE allow_item;
+    DROP TABLE focus_task;
+    """,
 ]
+
+BACKUPS_KEPT = 2        # 업그레이드 전 자동 백업을 최근 몇 개까지 남길지
+SITE_REFRESH_DAYS = 30  # 공개 사이트 목록(UT1)을 며칠마다 새로 받을지
 
 RETENTION_DAYS = 90     # 원본 기록(usage_session, block_event) 보관 기간. 요약·기억은 영구
 
@@ -226,12 +299,61 @@ def connect(path: str) -> sqlite3.Connection:
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     db = sqlite3.connect(path)
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if path != ":memory:" and 0 < version < len(MIGRATIONS):
+        backup_before_upgrade(db, path, version)
     db.executescript(SCHEMA)
     migrate(db)
     if db.execute("SELECT COUNT(*) FROM block_rule").fetchone()[0] == 0:
         save_rules(db, DEFAULT_RULES)                # 첫 실행: 기본 규칙 심기
     summarize_and_prune(db)
     return db
+
+
+# 채찍·당근 점수 규칙 (시작용 기본값 — 쓰면서 조정)
+SCORE_FOCUS_MIN = 30          # 🥕 하루 집중이 이만큼 넘으면 +5
+SCORE_DISTRACT_MIN = 30       # 🪓 하루 딴짓이 이만큼 넘으면 -5
+SCORE_BASELINE_DAYS = 7       # 🧠 '평소' = 최근 며칠 평균
+
+
+def score_day(db: sqlite3.Connection, day: str) -> list[tuple[str, str, int]]:
+    """
+    끝난 하루(daily_summary 로 요약된 날)의 채찍·당근. [(kind, 이유, 점수)].
+      🥕 집중 30분 이상 +5, 평소보다 많이 집중 +5, 숏폼 0회 +3, "어디야?" 모두 대답 +2
+      🪓 딴짓 30분 이상 -5, 평소보다 딴짓 20% 넘게 많음 -5, 숏폼 1회당 -2(최대 -10), "어디야?" 무응답 1회당 -1
+      🧠 평소 기준(최근 7일 평균)을 기록
+    """
+    focus, distract, shorts = db.execute(
+        "SELECT COALESCE(SUM(focus_minutes), 0), COALESCE(SUM(distract_minutes), 0), COALESCE(SUM(shorts_seen), 0)"
+        " FROM daily_summary WHERE day = ?", (day,)).fetchone()
+    base = db.execute(
+        "SELECT AVG(f), AVG(d), COUNT(*) FROM (SELECT SUM(focus_minutes) AS f, SUM(distract_minutes) AS d"
+        " FROM daily_summary WHERE day < ? AND day >= date(?, ?) GROUP BY day)",
+        (day, day, f"-{SCORE_BASELINE_DAYS} days")).fetchone()
+    asked, missed = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(answered_at IS NULL), 0) FROM focus_checkin"
+        " WHERE date(asked_at, 'localtime') = ?", (day,)).fetchone()
+
+    out = []
+    if focus >= SCORE_FOCUS_MIN:
+        out.append(("carrot", f"집중 {focus:.0f}분", 5))
+    if base[2] and focus > base[0] + 1:
+        out.append(("carrot", f"평소({base[0]:.0f}분)보다 {focus - base[0]:.0f}분 더 집중", 5))
+    if shorts == 0 and focus + distract > 0:
+        out.append(("carrot", "숏폼 0회", 3))
+    if asked and not missed:
+        out.append(("carrot", f"'어디야?' {asked}번 모두 대답", 2))
+    if distract >= SCORE_DISTRACT_MIN:
+        out.append(("stick", f"딴짓 {distract:.0f}분", -5))
+    if base[2] and distract > base[1] * 1.2 and distract - base[1] >= 10:
+        out.append(("stick", f"평소({base[1]:.0f}분)보다 딴짓 {distract - base[1]:.0f}분 더", -5))
+    if shorts:
+        out.append(("stick", f"숏폼 {shorts}회", -min(2 * shorts, 10)))
+    if missed:
+        out.append(("stick", f"'어디야?' {missed}번 무응답", -missed))
+    if base[2]:
+        out.append(("training", f"평소(최근 {base[2]}일 평균): 집중 {base[0]:.0f}분 · 딴짓 {base[1]:.0f}분", 0))
+    return out
 
 
 def summarize_and_prune(db: sqlite3.Connection, keep_days: int = RETENTION_DAYS) -> None:
@@ -241,6 +363,7 @@ def summarize_and_prune(db: sqlite3.Connection, keep_days: int = RETENTION_DAYS)
     한 트랜잭션이라 요약이 실패하면 삭제도 일어나지 않는다. 여러 번 실행해도 결과가 같다.
     """
     with db:
+        before = {d for (d,) in db.execute("SELECT DISTINCT day FROM daily_summary")}
         db.execute("""
             INSERT INTO daily_summary (day, exe, url_host, minutes, sessions, shorts_seen, shorts_closed,
                                        focus_minutes, distract_minutes, unknown_minutes)
@@ -261,11 +384,26 @@ def summarize_and_prune(db: sqlite3.Connection, keep_days: int = RETENTION_DAYS)
             WHERE day < date('now', 'localtime')
               AND day NOT IN (SELECT day FROM daily_summary)
             GROUP BY day, exe, host""".replace("{SHORTFORM_EVENT}", SHORTFORM_EVENT))
+        for day in sorted({d for (d,) in db.execute("SELECT DISTINCT day FROM daily_summary")} - before):
+            db.executemany("INSERT INTO cat_memory (day, kind, reason, points, created_at) VALUES (?, ?, ?, ?, ?)",
+                           [(day, kind, reason, points, now_iso()) for kind, reason, points in score_day(db, day)])
         cutoff = f"-{keep_days} days"
         db.execute("DELETE FROM usage_session WHERE date(started_at, 'localtime') < date('now', 'localtime', ?)"
                    " AND date(started_at, 'localtime') IN (SELECT day FROM daily_summary)", (cutoff,))
         db.execute("DELETE FROM block_event WHERE date(occurred_at, 'localtime') < date('now', 'localtime', ?)"
                    " AND date(occurred_at, 'localtime') IN (SELECT day FROM daily_summary)", (cutoff,))
+
+
+def backup_before_upgrade(db: sqlite3.Connection, path: str, version: int) -> None:
+    """스키마를 올리기 전에 DB를 통째로 복사해 둔다 (cat.backup-v{지금 버전}.db). 최근 BACKUPS_KEPT 개만 남긴다."""
+    import glob
+    target = os.path.join(os.path.dirname(os.path.abspath(path)), f"cat.backup-v{version}.db")
+    with sqlite3.connect(target) as out:
+        db.backup(out)
+    out.close()
+    old = sorted(glob.glob(os.path.join(os.path.dirname(target), "cat.backup-*.db")), key=os.path.getmtime)
+    for f in old[:-BACKUPS_KEPT]:
+        os.remove(f)
 
 
 def migrate(db: sqlite3.Connection) -> None:
@@ -300,15 +438,15 @@ def load_rules(db: sqlite3.Connection) -> list[Rule]:
 
 
 def save_session(db: sqlite3.Connection, s: Session, verdict: str | None = None,
-                 task_id: int | None = None, video_kind: str | None = None) -> None:
+                 video_kind: str | None = None) -> None:
     if s.duration_sec <= MIN_SESSION_SEC:
         return
     with db:
         db.execute("INSERT INTO usage_session (started_at, ended_at, exe, window_title,"
-                   " url_host, url, duration_sec, is_idle, verdict, task_id, video_kind)"
-                   " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   " url_host, url, duration_sec, is_idle, verdict, video_kind)"
+                   " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (s.started_at, s.ended_at, s.exe, s.title, _host(s.url), s.url,
-                    round(s.duration_sec, 1), int(s.is_idle), verdict, task_id, video_kind))
+                    round(s.duration_sec, 1), int(s.is_idle), verdict, video_kind))
 
 
 # =============================================================================
@@ -367,14 +505,35 @@ def load_video_labels(db: sqlite3.Connection) -> dict:
             db.execute("SELECT video_id, category, user_label FROM video_info")}
 
 
-def save_video(db: sqlite3.Connection, vid: str, category: str | None = None, user_label: str | None = None) -> None:
+def save_video(db: sqlite3.Connection, vid: str, category: str | None = None, user_label: str | None = None,
+               title: str | None = None) -> None:
     """카테고리나 사용자 대답을 저장. 이미 있으면 준 값만 덮어쓴다."""
     with db:
-        db.execute("INSERT INTO video_info (video_id, category, user_label, fetched_at) VALUES (?, ?, ?, ?)"
+        db.execute("INSERT INTO video_info (video_id, category, user_label, title, fetched_at) VALUES (?, ?, ?, ?, ?)"
                    " ON CONFLICT(video_id) DO UPDATE SET"
                    " category = COALESCE(excluded.category, category),"
-                   " user_label = COALESCE(excluded.user_label, user_label)",
-                   (vid, category, user_label, now_iso()))
+                   " user_label = COALESCE(excluded.user_label, user_label),"
+                   " title = COALESCE(excluded.title, title)",
+                   (vid, category, user_label, title, now_iso()))
+
+
+def learned(db: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    """🧠 내가 대답해서 고양이가 배운 것: [(종류 'site'|'video', 키, 보여줄 이름, 판정)]."""
+    sites = [("site", k, k, kind) for k, kind in
+             db.execute("SELECT key, kind FROM site_kind WHERE source = 'user' ORDER BY updated_at DESC")]
+    videos = [("video", vid, title or vid, label) for vid, title, label in
+              db.execute("SELECT video_id, title, user_label FROM video_info WHERE user_label IS NOT NULL"
+                         " ORDER BY fetched_at DESC")]
+    return sites + videos
+
+
+def forget(db: sqlite3.Connection, what: str, key: str) -> None:
+    """배운 것 하나를 지운다 → 다음에 다시 물어본다."""
+    with db:
+        if what == "site":
+            db.execute("DELETE FROM site_kind WHERE key = ? AND source = 'user'", (key,))
+        else:
+            db.execute("UPDATE video_info SET user_label = NULL WHERE video_id = ?", (key,))
 
 
 # =============================================================================
@@ -382,8 +541,7 @@ def save_video(db: sqlite3.Connection, vid: str, category: str | None = None, us
 # =============================================================================
 
 ASK_UNKNOWN_SEC = 30          # 업무모드에서 모르는 창이 이만큼 앞에 있으면 "이것도 공부야?" 묻기
-AUTO_TASK = "자동 분류"         # 고양이가 배운 앱·사이트를 담는 목록 (할 일을 따로 고르지 않는다)
-CHECKIN_SEC = 20 * 60         # 허용된 창에 이만큼 있으면 "어디야?" 확인
+CHECKIN_SEC = 20 * 60         # 공부로 판정된 창에 이만큼 있으면 "어디야?" 확인
 CHECKIN_TIMEOUT_SEC = 3 * 60  # 확인에 이만큼 대답이 없으면 그때부터 자리 비움
 
 
@@ -391,7 +549,14 @@ def _bare_host(url: str | None) -> str:
     return (_host(url) or "").lower().removeprefix("www.")
 
 
-# 자동 분류용 내장 목록. 여기 없는 창은 업무모드에서 30초 뒤 "이것도 공부야?" 하고 물어 배운다.
+def _path(url: str | None) -> str:
+    """'youtube.com/@채널/videos' → '/@채널/videos', 'youtube.com' → '/'."""
+    rest = re.sub(r"^[a-z]+://", "", url or "")
+    i = min((rest.find(c) for c in "/?#" if c in rest), default=-1)
+    return "/" if i < 0 else ("/" + rest[i:] if rest[i] != "/" else rest[i:])
+
+
+# ② 내장 목록 — 자주 쓰는 공부·업무 / 딴짓 앱·사이트 (특히 UT1에 빈 곳이 많은 한국 사이트)
 FOCUS_APPS = {
     "code.exe", "pycharm64.exe", "idea64.exe", "devenv.exe", "arduino ide.exe", "rstudio.exe", "matlab.exe",
     "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "notepad.exe", "notepad++.exe",
@@ -403,35 +568,71 @@ DISTRACT_APPS = {"steam.exe", "leagueclient.exe", "league of legends.exe", "riot
 FOCUS_HOSTS = {
     "github.com", "stackoverflow.com", "stackexchange.com", "python.org", "developer.mozilla.org",
     "w3schools.com", "wikipedia.org", "notion.so", "notion.site", "claude.ai", "chatgpt.com",
-    "gemini.google.com", "colab.research.google.com", "kaggle.com", "dataq.or.kr", "q-net.or.kr",
-    "inflearn.com", "coursera.org", "udemy.com", "khanacademy.org", "scholar.google.com", "dbpia.co.kr",
-    "riss.kr", "arxiv.org", "music.youtube.com", "ac.kr",          # ac.kr = 대학 사이트 전부
+    "gemini.google.com", "colab.research.google.com", "drive.google.com", "kaggle.com",
+    "dataq.or.kr", "q-net.or.kr", "inflearn.com", "coursera.org", "udemy.com", "khanacademy.org",
+    "scholar.google.com", "dbpia.co.kr", "riss.kr", "arxiv.org", "music.youtube.com", "ac.kr",
+    # 한국 공부 사이트
+    "wikidocs.net", "velog.io", "programmers.co.kr", "acmicpc.net", "solved.ac", "codeup.kr", "elice.io",
+    "boostcourse.org", "kocw.net", "kmooc.kr", "papago.naver.com", "dict.naver.com", "figma.com",
 }
 FOCUS_HOST_PREFIXES = ("docs.",)                                   # docs.python.org, docs.google.com …
 DISTRACT_HOSTS = {
     "netflix.com", "twitch.tv", "chzzk.naver.com", "sooplive.co.kr", "afreecatv.com", "tiktok.com",
-    "instagram.com", "facebook.com", "x.com", "twitter.com", "comic.naver.com", "fmkorea.com",
-    "dcinside.com", "reddit.com", "tving.com", "wavve.com", "coupangplay.com", "disneyplus.com",
+    "instagram.com", "facebook.com", "x.com", "twitter.com", "reddit.com",
+    "tving.com", "wavve.com", "coupangplay.com", "disneyplus.com", "watcha.com", "laftel.net",
+    # 한국 딴짓 사이트
+    "comic.naver.com", "series.naver.com", "sports.naver.com", "webtoon.kakao.com", "page.kakao.com",
+    "fmkorea.com", "dcinside.com", "theqoo.net", "instiz.net", "ruliweb.com", "inven.co.kr", "arca.live",
+    "ppomppu.co.kr", "coupang.com", "11st.co.kr", "gmarket.co.kr", "musinsa.com",
 }
+
+# ④ 경로 규칙 — 한 사이트 안에서 주소로 나눈다: (호스트, 경로 정규식, 판정). 호스트는 정확히 일치.
+PATH_RULES = (
+    ("youtube.com", r"^/(\?|#|$)", "distract"),                         # 유튜브 홈 피드
+    ("youtube.com", r"^/(@|channel/|c/|user/|feed/|playlist)", "distract"),   # 채널·구독·재생목록 둘러보기
+    ("m.youtube.com", r"^/(\?|#|$)", "distract"),
+)
+
+# ① 공개 도메인 목록 (UT1, Université Toulouse Capitole, CC BY-SA 4.0) — 딴짓 분류만 받는다
+UT1_URL = "https://raw.githubusercontent.com/olbat/ut1-blacklists/master/blacklists/{}/domains"
+UT1_DISTRACT = ("games", "social_networks", "audio-video", "sports", "gambling", "manga", "shopping", "dating")
 
 
 def _host_in(host: str, domains) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
-def is_allowed(win, items) -> bool:
-    """고양이가 배운 목록(앱·사이트)에 있나."""
+def window_key(win) -> tuple[str, str]:
+    """고양이가 '이 창'을 기억하는 단위: 브라우저는 사이트, 나머지는 앱."""
     host = _bare_host(win.url)
-    for kind, value in items:
-        if kind == "app" and win.exe.lower() == value.lower():
-            return True
-        if kind == "host" and host and _host_in(host, (value,)):
-            return True
-    return False
+    return ("host", host) if host else ("app", win.exe)
+
+
+def site_lookup(sites: dict, win, user: bool) -> str | None:
+    """
+    site_kind 에서 이 창의 판정을 찾는다. 도메인은 가장 구체적인 것부터(a.b.com → b.com).
+    user=True 면 내가 대답한 것만, False 면 공개 목록(UT1)만.
+    """
+    host = _bare_host(win.url)
+    parts = host.split(".") if host else []
+    keys = [".".join(parts[i:]) for i in range(len(parts) - 1)] if host else [win.exe.lower()]
+    for k in keys:
+        hit = sites.get(k)
+        if hit and (hit[1] == "user") == user:
+            return hit[0]
+    return None
+
+
+def path_kind(win) -> str | None:
+    host = _bare_host(win.url)
+    for h, pattern, kind in PATH_RULES:
+        if host == h and re.search(pattern, _path(win.url)):
+            return kind
+    return None
 
 
 def builtin_kind(win) -> str | None:
-    """내장 목록으로 본 창 종류: focus / distract / None(모름)."""
+    """② 내장 목록으로 본 창 종류: focus / distract / None(모름)."""
     host, exe = _bare_host(win.url), win.exe.lower()
     if host:
         if _host_in(host, FOCUS_HOSTS) or host.startswith(FOCUS_HOST_PREFIXES):
@@ -446,44 +647,63 @@ def builtin_kind(win) -> str | None:
     return None
 
 
-def window_key(win) -> tuple[str, str]:
-    """고양이가 '이 창'을 기억하는 단위: 브라우저는 사이트, 나머지는 앱."""
-    host = _bare_host(win.url)
-    return ("host", host) if host else ("app", win.exe)
-
-
-def classify(win, rules, items, decided: dict) -> str:
-    """focus(업무·공부) / distract(딴짓) / unknown(모름)."""
+def classify(win, rules, sites: dict, decided: dict) -> str:
+    """
+    focus(업무·공부) / distract(딴짓) / unknown(모름). 위에서부터 먼저 걸리는 것:
+      쇼츠 규칙 → 유튜브 영상 종류 → 이번 실행 대답 → ③ 내 대답(배운 것) → ④ 경로 규칙
+      → ② 내장 목록 → ① 공개 도메인 목록 → 제목 키워드 → 모름
+    """
     if pick_rule(rules, win):
         return "distract"
-    if getattr(win, "video_kind", None) in ("lecture", "music"):   # 유튜브 카테고리/대답으로 판단
+    kind = getattr(win, "video_kind", None)
+    if kind in ("lecture", "music"):
         return "focus"
-    if window_key(win) in decided:                       # "이번만" / "아니, 딴짓" 대답
+    if kind == "fun":
+        return "distract"
+    if kind == "ask":                                    # 애매한 영상: "이거 강의 맞아?" 대답 전까지 모름
+        return "unknown"
+    if window_key(win) in decided:                       # "이번만"
         return decided[window_key(win)]
-    if is_allowed(win, items):
-        return "focus"
-    if builtin_kind(win):
-        return builtin_kind(win)
+    for judge in (lambda: site_lookup(sites, win, user=True), lambda: path_kind(win),
+                  lambda: builtin_kind(win), lambda: site_lookup(sites, win, user=False)):
+        verdict = judge()
+        if verdict:
+            return verdict
     if win.url and not video_id(win.url) and re.search(STUDY_WORDS, win.title or "", re.IGNORECASE):
-        return "focus"                                   # 유튜브 밖 강의 사이트 등 (보조 수단)
+        return "focus"                                   # 강의 사이트 등 (보조 수단)
     return "unknown"
 
 
-def load_allow(db: sqlite3.Connection, task_id: int) -> list[tuple[str, str]]:
-    return db.execute("SELECT kind, value FROM allow_item WHERE task_id = ? ORDER BY item_id",
-                      (task_id,)).fetchall()
+def load_site_kinds(db: sqlite3.Connection) -> dict:
+    return {k: (kind, src) for k, kind, src in db.execute("SELECT key, kind, source FROM site_kind")}
 
 
-def add_allow(db: sqlite3.Connection, task_id: int, kind: str, value: str, learned: bool = False) -> None:
+def save_site(db: sqlite3.Connection, key: str, kind: str) -> None:
+    """③ 사용자 대답을 영구히 기억 (공개 목록보다 우선)."""
     with db:
-        db.execute("INSERT OR IGNORE INTO allow_item (task_id, kind, value, learned) VALUES (?, ?, ?, ?)",
-                   (task_id, kind, value, int(learned)))
+        db.execute("INSERT INTO site_kind (key, kind, source, updated_at) VALUES (?, ?, 'user', ?)"
+                   " ON CONFLICT(key) DO UPDATE SET kind = excluded.kind, source = 'user',"
+                   " updated_at = excluded.updated_at", (key.lower(), kind, now_iso()))
 
 
-def get_or_create_task(db: sqlite3.Connection, name: str) -> int:
-    with db:
-        db.execute("INSERT OR IGNORE INTO focus_task (name, created_at) VALUES (?, ?)", (name, now_iso()))
-    return db.execute("SELECT task_id FROM focus_task WHERE name = ?", (name,)).fetchone()[0]
+def update_site_lists(db: sqlite3.Connection, fetch_text=None) -> int:
+    """① UT1 딴짓 분류를 내려받아 site_kind 에 넣는다. 내가 대답한 사이트(user)는 덮어쓰지 않는다."""
+    if fetch_text is None:
+        import urllib.request
+
+        def fetch_text(url: str) -> str:
+            return urllib.request.urlopen(url, timeout=30).read().decode("utf-8", "replace")
+    total, now = 0, now_iso()
+    for cat in UT1_DISTRACT:
+        domains = {d.strip().lower() for d in fetch_text(UT1_URL.format(cat)).splitlines()
+                   if d.strip() and not d.startswith("#")}
+        with db:
+            db.executemany("INSERT INTO site_kind (key, kind, source, updated_at) VALUES (?, 'distract', ?, ?)"
+                           " ON CONFLICT(key) DO UPDATE SET kind = excluded.kind, source = excluded.source,"
+                           " updated_at = excluded.updated_at WHERE site_kind.source != 'user'",
+                           [(d, f"ut1:{cat}", now) for d in domains])
+        total += len(domains)
+    return total
 
 
 def remember(db: sqlite3.Connection, kind: str, reason: str, points: int = 0) -> None:
@@ -509,10 +729,10 @@ def seconds_matching(db: sqlite3.Connection, rule: Rule, current_sec: float = 0.
     저장된 제목·주소를 규칙에 다시 대 본다.
     """
     total = current_sec
-    for exe, title, url, sec, kind in db.execute(
-            "SELECT exe, window_title, url, duration_sec, video_kind FROM usage_session"
+    for exe, title, url, sec, kind, verdict in db.execute(
+            "SELECT exe, window_title, url, duration_sec, video_kind, verdict FROM usage_session"
             " WHERE is_idle = 0 AND date(started_at, 'localtime') = date('now', 'localtime')"):
-        if rule_matches(rule, WindowInfo(title or "", exe, url, video_kind=kind)):
+        if rule_matches(rule, WindowInfo(title or "", exe, url, video_kind=kind, verdict=verdict)):
             total += sec
     return int(total)
 
@@ -562,6 +782,32 @@ def breakdown_text(db: sqlite3.Connection) -> str:
     return "\n".join(parts)
 
 
+def checkins_text(db: sqlite3.Connection) -> str:
+    """오늘 '어디야?' 확인과 '어디까지 했어?' 메모."""
+    rows = db.execute("SELECT strftime('%H:%M', asked_at, 'localtime'), answer, note FROM focus_checkin"
+                      " WHERE date(asked_at, 'localtime') = date('now', 'localtime') ORDER BY asked_at").fetchall()
+    if not rows:
+        return "🐱 어디야? — 오늘 확인 없음"
+    label = {"focus": "📚 하는 중", "break": "☕ 쉬는 중", None: "💤 대답 없음"}
+    return "🐱 어디야?\n" + "\n".join(f"    {t}  {label[a]}" + (f" — {n}" if n else "") for t, a, n in rows)
+
+
+def score_text(db: sqlite3.Connection) -> str:
+    """가장 최근에 점수를 매긴 날의 채찍·당근."""
+    day = db.execute("SELECT MAX(day) FROM cat_memory WHERE kind IN ('carrot', 'stick')").fetchone()[0]
+    if not day:
+        return "🥕🪓 채찍·당근 — 하루가 끝나면 다음 날 켤 때 매겨요"
+    rows = db.execute("SELECT kind, reason, points FROM cat_memory WHERE day = ? ORDER BY memory_id", (day,)).fetchall()
+    total = sum(p for _, _, p in rows)
+    icon = {"carrot": "🥕", "stick": "🪓", "training": "🧠"}
+    return f"🥕🪓 {day} 점수 {total:+d}\n" + "\n".join(f"    {icon[k]} {r}" + (f" ({p:+d})" if p else "")
+                                                     for k, r, p in rows)
+
+
+def today_text(db: sqlite3.Connection) -> str:
+    return "\n\n".join((breakdown_text(db), checkins_text(db), score_text(db)))
+
+
 def print_report(db: sqlite3.Connection, since: str | None = None) -> None:
     """since(이번에 켠 시각, UTC)가 있으면 '이번 실행'과 '오늘 전체'를 나눠 보여 준다."""
     blocks = ([("이번에 켠 뒤", since)] if since else []) + [("오늘 전체 (앞서 켰던 것 포함)", None)]
@@ -577,7 +823,7 @@ def print_report(db: sqlite3.Connection, since: str | None = None) -> None:
         f" FROM block_event WHERE {SHORTFORM_EVENT}"
         " AND date(occurred_at, 'localtime') = date('now', 'localtime')").fetchone()
     print("─" * 46 + f"\n숏폼 감지 {seen}회 · 고양이가 실제로 닫은 횟수 {closed}회")
-    print("─" * 46 + "\n오늘 한 일\n" + breakdown_text(db))
+    print("─" * 46 + "\n오늘 한 일\n" + today_text(db))
 
 
 # =============================================================================
@@ -622,8 +868,8 @@ class Control:
         self.stop = threading.Event()
         self.delay_request = 0               # >0 이면 창(메인 스레드)이 그 초만큼 '기다려' 화면을 띄운다
         self.muted_exe: str | None = None    # 고양이가 소리를 끈 앱 (벗어나면 다시 켠다)
-        self.task_id: int | None = None      # '자동 분류' 목록 번호 (루프가 시작할 때 정한다)
-        self.allow_items: list = []          # 고양이가 배운 앱·사이트 — 창에서 배우면 바로 바꿔 끼운다
+        self.site_kinds: dict = {}           # 사이트·앱 → (판정, 출처). 창에서 배우면 바로 여기에 더한다
+        self.sites_changed = False           # 공개 목록을 새로 받았으니 다시 읽으라는 신호
         self.decided: dict = {}              # "이번만" / "아니, 딴짓" 대답 (이번 실행 동안만)
         self.ui_requests: queue.Queue = queue.Queue()   # 루프 → 창: ("unknown", key, 제목) / ("checkin",)
         self.video_labels: dict = {}         # 영상 ID → (YouTube 카테고리, 사용자 대답)
@@ -716,13 +962,14 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
                  font=(FONT, 10), padx=20, pady=12, justify="center").pack()
 
         def answer(choice: str) -> None:
-            if choice == "remember":
-                add_allow(uidb, ctl.task_id, kind, value, learned=True)
-                ctl.allow_items = load_allow(uidb, ctl.task_id)
-                remember(uidb, "training", f"{value}도 공부·업무라고 배움")
+            if choice == "once":
+                ctl.decided[key] = "focus"
+            else:                                        # "응, 기억해" / "아니, 딴짓" — 둘 다 영구히 기억
+                verdict = "focus" if choice == "remember" else "distract"
+                save_site(uidb, value, verdict)
+                ctl.site_kinds[value.lower()] = (verdict, "user")
+                remember(uidb, "training", f"{value} → {'공부·업무' if verdict == 'focus' else '딴짓'}(이)라고 배움")
                 ctl.last = f"🧠 {value} 기억했어"
-            else:
-                ctl.decided[key] = "focus" if choice == "once" else "distract"
             pop.destroy()
 
         row = tk.Frame(pop)
@@ -736,7 +983,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         tk.Label(pop, text=f"🐱 이거 강의 맞아?\n\n{title[:45]}", font=(FONT, 10), padx=20, pady=12).pack()
 
         def answer(label: str) -> None:
-            save_video(uidb, vid, user_label=label)
+            save_video(uidb, vid, user_label=label, title=title)
             ctl.video_labels[vid] = (ctl.video_labels.get(vid, (None, None))[0], label)
             remember(uidb, "training", f"'{title[:25]}' → {VIDEO_LABEL[label]}(이)라고 배움")
             ctl.last = f"🧠 {VIDEO_LABEL[label]}(으)로 기억했어"
@@ -750,8 +997,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
     def ask_checkin() -> None:
         """허용된 창에 20분 있으면: 🐱 어디야? — 3분 안에 대답 없으면 그때부터 자리 비움."""
         with uidb:
-            cid = uidb.execute("INSERT INTO focus_checkin (task_id, asked_at) VALUES (?, ?)",
-                               (ctl.task_id, now_iso())).lastrowid
+            cid = uidb.execute("INSERT INTO focus_checkin (asked_at) VALUES (?)", (now_iso(),)).lastrowid
         pop = popup("어디야?")
         tk.Label(pop, text=f"🐱 어디야?\n아직 공부·업무 중이야?",
                  font=(FONT, 11, "bold"), padx=20, pady=10).pack()
@@ -786,14 +1032,48 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         def refresh() -> None:
             text.config(state="normal")
             text.delete("1.0", "end")
-            text.insert("end", breakdown_text(uidb) + "\n\n(지금 보고 있는 창은 다른 창으로 옮겨야 더해져요)")
+            text.insert("end", today_text(uidb) + "\n\n(지금 보고 있는 창은 다른 창으로 옮겨야 더해져요)")
             text.config(state="disabled")
         tk.Button(pop, text="새로고침", command=refresh).pack(pady=6)
+        refresh()
+
+    def show_learned() -> None:
+        """🧠 배운 것 — 내가 대답해서 고양이가 기억한 사이트·영상. 골라서 지우면 다음에 다시 물어본다."""
+        pop = popup("배운 것")
+        tk.Label(pop, text="🧠 고양이가 배운 것 (잘못 답했으면 골라서 지우기)", font=(FONT, 10, "bold"), pady=8).pack()
+        box = tk.Listbox(pop, width=60, height=14, font=(FONT, 9), selectmode="extended")
+        box.pack(padx=12)
+        items: list = []
+        mark = {"focus": "📚 공부·업무", "distract": "😼 딴짓", "lecture": "📚 강의", "music": "🎵 노래", "fun": "😼 딴짓 영상"}
+
+        def refresh() -> None:
+            box.delete(0, "end")
+            items[:] = learned(uidb)
+            for what, _, name, kind in items:
+                box.insert("end", f"{'🌐' if what == 'site' else '▶️'}  {name[:45]}  →  {mark.get(kind, kind)}")
+            if not items:
+                box.insert("end", "(아직 배운 것이 없어요)")
+
+        def remove() -> None:
+            for i in box.curselection():
+                if i >= len(items):
+                    continue
+                what, key, name, _ = items[i]
+                forget(uidb, what, key)
+                if what == "site":
+                    ctl.site_kinds.pop(key, None)
+                else:
+                    ctl.video_labels[key] = (ctl.video_labels.get(key, (None, None))[0], None)
+                remember(uidb, "training", f"{name[:25]} 대답을 지움 (다시 물어보기)")
+            refresh()
+
+        tk.Button(pop, text="선택 지우기", command=remove).pack(pady=8)
         refresh()
 
     row = tk.Frame(root)
     row.pack()
     tk.Button(row, text="📊 오늘 한 일", font=(FONT, 9), command=show_today).pack(side="left", padx=2)
+    tk.Button(row, text="🧠 배운 것", font=(FONT, 9), command=show_learned).pack(side="left", padx=2)
     status = tk.Label(root, fg="#555", wraplength=260, pady=10, font=("맑은 고딕", 9))
     status.pack()
     tk.Label(root, text="창을 닫으면 고양이도 쉽니다", fg="#999", font=("맑은 고딕", 8)).pack(pady=(0, 8))
@@ -874,9 +1154,7 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
         fetch=fetch_category) -> None:
     rules = load_rules(db)
     ctl.video_labels.update(load_video_labels(db))
-    if ctl.task_id is None:
-        ctl.task_id = get_or_create_task(db, AUTO_TASK)
-        ctl.allow_items = load_allow(db, ctl.task_id)
+    ctl.site_kinds.update(load_site_kinds(db))
     fetching: set = set()                 # 카테고리를 가져오는 중인 영상
     watched_for: dict = {}                # 애매한 영상별로 본 시간
     asked_videos: set = set()
@@ -914,8 +1192,8 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
     def on_session_end(s: Session) -> None:
         win_ = WindowInfo(s.title, s.exe, s.url)
         win_ = replace(win_, video_kind=kind_of(win_))
-        verdict = "away" if s.is_idle else classify(win_, rules, ctl.allow_items, ctl.decided)
-        save_session(db, s, verdict, ctl.task_id, win_.video_kind)
+        verdict = "away" if s.is_idle else classify(win_, rules, ctl.site_kinds, ctl.decided)
+        save_session(db, s, verdict, video_kind=win_.video_kind)
 
     tracker = SessionTracker(on_session_end)
     last_tick = time.monotonic()
@@ -942,7 +1220,12 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     if watched_for[vid] >= ASK_VIDEO_SEC and vid not in asked_videos:
                         asked_videos.add(vid)
                         ctl.ui_requests.put(("video", vid, win.title))
-            verdict = classify(win, rules, ctl.allow_items, ctl.decided) if win else None
+            if ctl.sites_changed:                           # 공개 목록을 새로 받음
+                ctl.sites_changed = False
+                ctl.site_kinds.update(load_site_kinds(db))
+            verdict = classify(win, rules, ctl.site_kinds, ctl.decided) if win else None
+            if win is not None:
+                win = replace(win, verdict=verdict)         # 딴짓 규칙은 이 판정을 본다
             if ctl.action == "close" and win is not None:
                 if verdict == "unknown" and "youtube.com" not in _bare_host(win.url):
                     # 모르는 창 → 30초 넘으면 한 번 물어봄 (유튜브는 영상마다 따로 물으니 사이트 통째로는 안 물음)
@@ -1007,6 +1290,27 @@ def unmute(probe, ctl: Control) -> None:
     ctl.muted_exe = None
 
 
+def sites_need_refresh(db: sqlite3.Connection) -> bool:
+    """공개 목록을 한 번도 안 받았거나 SITE_REFRESH_DAYS 일이 지났으면 True."""
+    last = db.execute("SELECT MAX(updated_at) FROM site_kind WHERE source LIKE 'ut1:%'").fetchone()[0]
+    return last is None or db.execute("SELECT ? < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)",
+                                      (last, f"-{SITE_REFRESH_DAYS} days")).fetchone()[0] == 1
+
+
+def download_site_lists(db_path: str, ctl: Control | None = None) -> None:
+    """공개 도메인 목록을 받아 저장 (처음 켤 때 뒤에서, 또는 --update-sites)."""
+    db = connect(db_path)
+    try:
+        n = update_site_lists(db)
+        print(f"🌐 사이트 분류 목록 {n:,}개를 받았어요 (UT1)")
+        if ctl:
+            ctl.sites_changed = True
+    except Exception as e:                               # noqa: BLE001 — 인터넷이 없으면 다음에
+        print(f"🌐 사이트 분류 목록을 못 받았어요 ({type(e).__name__}) — 다음에 켤 때 다시 시도")
+    finally:
+        db.close()
+
+
 def watch_in_background(db_path: str, interval: float, ctl: Control) -> None:
     """작업 스레드. SQLite 연결과 UI Automation은 쓰는 스레드 안에서 만들어야 한다."""
     try:
@@ -1016,6 +1320,8 @@ def watch_in_background(db_path: str, interval: float, ctl: Control) -> None:
         uia_ready = contextlib.nullcontext()
     with uia_ready:
         db = connect(db_path)
+        if sites_need_refresh(db):
+            threading.Thread(target=download_site_lists, args=(db_path, ctl), daemon=True).start()
         try:
             run(db, WindowsProbe(), interval, ctl, stop_when_empty=False)
         except Exception as e:                           # noqa: BLE001
@@ -1033,6 +1339,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="집사 고양이 v0.1")
     ap.add_argument("--simulate", action="store_true", help="가짜 시나리오 + 메모리 DB")
     ap.add_argument("--report", action="store_true", help="오늘 사용 통계만 출력")
+    ap.add_argument("--update-sites", action="store_true", help="사이트 분류 목록(UT1)을 새로 받는다")
     ap.add_argument("--db", default=DEFAULT_DB, help=f"기본값: {DEFAULT_DB}")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--action", choices=["log", "close"], default="log",
@@ -1047,6 +1354,9 @@ def main() -> int:
         db = connect(":memory:")
         run(db, SimulatedProbe(), 0.05, Control("log"), stop_when_empty=True,
             fetch=lambda vid: "Entertainment")           # 시뮬레이션은 인터넷에 묻지 않는다
+    elif args.update_sites:
+        download_site_lists(args.db)
+        return 0
     elif args.report:
         db = connect(args.db)
     elif sys.platform != "win32":
