@@ -24,7 +24,7 @@ import re
 import sqlite3
 import sys
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import time
 from datetime import date
 
@@ -836,6 +836,25 @@ def checkins_text(db: sqlite3.Connection) -> str:
 # 🐟 간식과 포만감
 SNACK_EVERY_SEC = 20 * 60     # 딴짓 없이 이만큼 지나면 간식 +1 (딴짓하면 처음부터)
 HUNGER_EVERY_SEC = 60 * 60    # 앱이 켜져 있는 동안 이만큼마다 포만감 -1
+
+
+@dataclass(frozen=True)
+class Timing:
+    """고양이의 모든 시간 간격(초). 평소 값 / 🧪 --test 값."""
+    step: int | None = None               # 딴짓 단계 간격 (None = DB 값, 평소 5분)
+    ask_video: float = ASK_VIDEO_SEC       # 애매한 영상 → "이거 강의 맞아?"
+    ask_unknown: float = ASK_UNKNOWN_SEC   # 모르는 창 → "이것도 공부야?"
+    checkin: float = CHECKIN_SEC           # 공부 창 → "어디야?"
+    checkin_timeout: float = CHECKIN_TIMEOUT_SEC   # 무응답 → 자리 비움
+    eye_every: float = EYE_EVERY_SEC       # 👀 눈 쉬기 주기
+    eye_rest: int = EYE_REST_SEC           # 👀 눈 쉬는 시간
+    snack_every: float = SNACK_EVERY_SEC   # 🐟 딴짓 없이 → 간식 +1
+    hunger_every: float = HUNGER_EVERY_SEC  # 🐟 포만감 -1
+
+
+# 🧪 테스트 모드: 전부 초 단위로 (주기가 겹치지 않게 조금씩 다르게)
+TEST_TIMING = Timing(step=10, ask_video=5, ask_unknown=5, checkin=40, checkin_timeout=15,
+                     eye_every=30, eye_rest=5, snack_every=20, hunger_every=60)
 FULL_MAX = 5
 
 # 😺 고양이 기분 = 포만감. 기분만큼 딴짓 단계 간격이 바뀐다 (간식을 먹여 기분 좋으면 차단 시간 확장).
@@ -988,6 +1007,7 @@ class Control:
         self.eye_on = True                   # 👀 20-20-20 눈 쉬기 (고양이 창에서 끄고 켠다)
         self.mood = ("🐱", "보통", 1.0, 2, 0)  # 😺 (얼굴, 이름, 딴짓 간격 배수, 포만감, 간식 수)
         self.anims: queue.Queue = queue.Queue()  # 루프 → 움직이는 고양이: (자세, 초)
+        self.timing = Timing()               # 시간 간격들 (🧪 --test 면 TEST_TIMING, DB 설정은 그대로)
         self.decided: dict = {}              # "이번만" / "아니, 딴짓" 대답 (이번 실행 동안만)
         self.ui_requests: queue.Queue = queue.Queue()   # 루프 → 창: ("unknown", key, 제목) / ("checkin",)
         self.video_labels: dict = {}         # 영상 ID → (YouTube 카테고리, 사용자 대답)
@@ -1282,7 +1302,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
 
         cover.bind("<Escape>", lambda _: finish(False))
         cover.focus_force()
-        count(EYE_REST_SEC)
+        count(ctl.timing.eye_rest)
 
     def tick() -> None:                      # 작업 스레드 소식을 0.5초마다 창에 반영
         status.config(text=ctl.last)
@@ -1327,11 +1347,19 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
                         + (f" — {face} 기분 좋아! 딴짓 간격 ×{mult:g}" if mult > 1 else ""))
         else:
             holder["cat"].act("angry", 2)
-            ctl.last = f"😾 간식이 없잖아! 딴짓 안 하고 {fmt_time(SNACK_EVERY_SEC)} 버티면 생겨"
+            ctl.last = f"😾 간식이 없잖아! 딴짓 안 하고 {fmt_time(ctl.timing.snack_every)} 버티면 생겨"
 
     def set_mode(action: str) -> None:
         mode.set(action)
         switch()
+
+    def toggle_test() -> None:
+        ctl.timing = Timing() if ctl.timing.step else TEST_TIMING
+        tm = ctl.timing
+        ctl.last = (f"🧪 테스트 모드 켬: 딴짓 {fmt_time(tm.step)} · 간식 {fmt_time(tm.snack_every)}"
+                    f" · 눈 쉬기 {fmt_time(tm.eye_every)} · 어디야 {fmt_time(tm.checkin)}"
+                    if tm.step else "🧪 테스트 모드 끔: 평소 시간 (딴짓 5분)")
+        print(f"=== {ctl.last} ===")
 
     def toggle_eye() -> None:
         eye_var.set(not eye_var.get())
@@ -1348,6 +1376,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         None,
         ("🐟 간식 주기", feed),
         ("👀 눈 쉬기 켜기/끄기", toggle_eye),
+        ("🧪 테스트 모드 켜기/끄기 (초 단위)", toggle_test),
         None,
         ("📊 오늘 한 일", show_today),
         ("🧠 배운 것", show_learned),
@@ -1434,6 +1463,10 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
     ctl.mood = cat_mood(db)
     face, mood_name, mult, full, snacks = ctl.mood
     ctl.last = f"{face} 안녕! 간식 {snacks}개 있어" + ("" if full else " — 배고파... 🐟")
+    tm = ctl.timing
+    if tm.step:
+        ctl.last += (f" · 🧪 테스트 모드: 딴짓 {fmt_time(tm.step)} · 간식 {fmt_time(tm.snack_every)}"
+                     f" · 눈 쉬기 {fmt_time(tm.eye_every)} · 어디야 {fmt_time(tm.checkin)} · 배고픔 {fmt_time(tm.hunger_every)}")
     eye_timer = 0.0                       # 👀 마지막으로 눈을 쉰 뒤 화면을 본 시간
     snack_timer = 0.0                     # 🐟 딴짓 없이 지난 시간
     hunger_timer = 0.0                    # 🐟 마지막으로 배고파진 뒤 앱이 켜져 있던 시간
@@ -1453,6 +1486,7 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
     last_tick = time.monotonic()
     try:
         while not ctl.stop.is_set():
+            tm = ctl.timing                                 # 🧪 메뉴에서 테스트 모드를 바꾸면 바로 적용
             win = probe.probe()
             if win is None and stop_when_empty:
                 break
@@ -1466,15 +1500,15 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     ctl.stop.wait(interval)
                 continue
             if ctl.eye_on and win is not None:              # 👀 20-20-20 (모드와 상관없이)
-                if probe.idle_seconds() >= EYE_REST_SEC:    # 20초 넘게 화면을 안 봤으면 이미 쉰 것
+                if probe.idle_seconds() >= tm.eye_rest:     # 눈 쉬는 시간보다 오래 화면을 안 봤으면 이미 쉰 것
                     eye_timer = 0.0
                 else:
                     eye_timer += elapsed
-                    if eye_timer >= EYE_EVERY_SEC:
+                    if eye_timer >= tm.eye_every:
                         eye_timer = 0.0
                         ctl.ui_requests.put(("eye",))
             hunger_timer += elapsed                         # 🐟 켜져 있는 동안 조금씩 배고파진다
-            if hunger_timer >= HUNGER_EVERY_SEC:
+            if hunger_timer >= tm.hunger_every:
                 hunger_timer = 0.0
                 if get_fullness(db) > 0:
                     set_fullness(db, get_fullness(db) - 1)
@@ -1487,7 +1521,7 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                 if win.video_kind == "ask" and ctl.action == "close":   # 애매한 영상 10초 → "이거 강의 맞아?"
                     vid = video_id(win.url)
                     watched_for[vid] = watched_for.get(vid, 0) + elapsed
-                    if watched_for[vid] >= ASK_VIDEO_SEC and vid not in asked_videos:
+                    if watched_for[vid] >= tm.ask_video and vid not in asked_videos:
                         asked_videos.add(vid)
                         ctl.ui_requests.put(("video", vid, win.title))
             if ctl.sites_changed:                           # 공개 목록을 새로 받음
@@ -1501,12 +1535,12 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     # 모르는 창 → 30초 넘으면 한 번 물어봄 (유튜브는 영상마다 따로 물으니 사이트 통째로는 안 물음)
                     key = window_key(win)
                     unknown_for[key] = unknown_for.get(key, 0) + elapsed
-                    if unknown_for[key] >= ASK_UNKNOWN_SEC and key not in asked:
+                    if unknown_for[key] >= tm.ask_unknown and key not in asked:
                         asked.add(key)
                         ctl.ui_requests.put(("unknown", key, win.title))
                 if verdict == "focus" and not ctl.checkin_pending:   # 허용된 창 20분 → "어디야?"
                     streak += elapsed
-                    if streak >= CHECKIN_SEC:
+                    if streak >= tm.checkin:
                         streak = 0.0
                         ctl.checkin_pending, ctl.checkin_waited = True, 0.0
                         ctl.ui_requests.put(("checkin",))
@@ -1517,13 +1551,13 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     ctl.checkin_waited += elapsed
             # 자리 비움: "어디야?"에 3분 넘게 대답 없음 — 또는 입력이 없는데 공부 창도 아님.
             # 공부 창(강의 영상 등)은 입력이 없어도 보고 있을 수 있어서 입력으로는 판단하지 않는다.
-            idle = ((ctl.checkin_pending and ctl.checkin_waited >= CHECKIN_TIMEOUT_SEC)
+            idle = ((ctl.checkin_pending and ctl.checkin_waited >= tm.checkin_timeout)
                     or (probe.idle_seconds() > IDLE_THRESHOLD_SEC and verdict != "focus"))
             if win is not None and not idle:                # 🐟 딴짓 없이 20분 → 간식 +1
                 snack_timer = 0.0 if verdict == "distract" else snack_timer + elapsed
-                if snack_timer >= SNACK_EVERY_SEC:
+                if snack_timer >= tm.snack_every:
                     snack_timer = 0.0
-                    add_snack(db, 1, "earn", f"{fmt_time(SNACK_EVERY_SEC)} 딴짓 안 함")
+                    add_snack(db, 1, "earn", f"{fmt_time(tm.snack_every)} 딴짓 안 함")
                     ctl.mood = cat_mood(db)
                     ctl.last = f"🐟 간식이 생겼어! ({ctl.mood[4]}개) 더블클릭해서 줘"
                     ctl.anims.put(("happy", 3))
@@ -1539,7 +1573,8 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                         continue
                     seconds = seconds_matching(db, rule, tracker.current.duration_sec)
                     # 😺 기분(포만감)만큼 간격을 늘이거나 줄인다 — 간식을 먹이면 그 자리에서 바뀐다
-                    rule = replace(rule, step_sec=max(1, int(rule.step_sec * ctl.mood[2])))
+                    base_step = tm.step or rule.step_sec                   # 🧪 테스트 모드면 10초
+                    rule = replace(rule, step_sec=max(1, int(base_step * ctl.mood[2])))
                     step = seconds // rule.step_sec
                     key = (rule.rule_id, date.today(), step * rule.step_sec)
                     if step >= 1 and key not in fired:
@@ -1620,6 +1655,9 @@ def main() -> int:
     ap.add_argument("--simulate", action="store_true", help="가짜 시나리오 + 메모리 DB")
     ap.add_argument("--report", action="store_true", help="오늘 사용 통계만 출력")
     ap.add_argument("--update-sites", action="store_true", help="사이트 분류 목록(UT1)을 새로 받는다")
+    ap.add_argument("--test", action="store_true",
+                    help="테스트 모드: 모든 간격을 초 단위로 — 딴짓 10초, 간식 20초, 눈 쉬기 30초(5초 쉼),"
+                         " 어디야 40초, 배고픔 1분 (DB 설정은 바꾸지 않음)")
     ap.add_argument("--db", default=DEFAULT_DB, help=f"기본값: {DEFAULT_DB}")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--action", choices=["log", "close"], default="log",
@@ -1647,6 +1685,7 @@ def main() -> int:
             print("🐱 집사 고양이가 이미 실행 중입니다. 떠 있는 고양이 창을 닫은 뒤 다시 실행하세요.")
             return 1
         ctl = Control(args.action)
+        ctl.timing = TEST_TIMING if args.test else Timing()
         started = now_iso()
         print(f"=== {mode_name(ctl.action)} 시작 (DB: {args.db}) — 고양이 창을 닫으면 종료 ===")
         worker = threading.Thread(target=watch_in_background,

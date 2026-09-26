@@ -77,12 +77,24 @@ def draw_cat(cv: tk.Canvas, cx: float, base: float, pose: str, t: int, s: float 
     blob(body, fur)
     if patch:                                         # 오른쪽 아래 크림 무늬
         blob([(30, -42), (43, -30), (40, -8), (30, -3), (24, -22)], patch)
-    step = 3 * math.sin(t / 2) if pose == "walk" else 0
     stroke([(-30, -58), (-44, -32), (-41, -9), (-33, -1), (-22, -2)])       # 왼쪽 옆구리와 둥근 발
     stroke([(30, -58), (44, -32), (41, -9), (33, -1), (22, -2)])            # 오른쪽
-    if pose not in ("block",):                        # 앞다리 두 줄 (발끝이 살짝 말린다)
-        stroke([(-10, -24 - step), (-10, -4), (-6, -1)])
-        stroke([(10, -24 + step), (10, -4), (6, -1)])
+    if pose == "walk":                                # 🚶 걸을 때: 앞다리가 번갈아 들리며 앞으로 나간다
+        for i, x in enumerate((-12, 12)):
+            phase = math.sin(t / 2 + i * math.pi)
+            lift, reach = max(0.0, 7 * phase), 6 * phase           # 드는 다리는 앞으로, 딛는 다리는 뒤로
+            top, foot = (x, -30), (x + reach, -5 - lift)
+            stroke([top, foot], width=w * 3.2)                     # 속이 흰 관 모양 다리
+            stroke([top, foot], width=w * 1.5, color=fur)
+            (a, b), (c, d) = P(foot[0] - 8, foot[1] - 5), P(foot[0] + 8, foot[1] + 5)
+            cv.create_oval(min(a, c), b, max(a, c), d, fill=fur, outline=INK, width=w * 0.8)   # 앞발
+            hx = -34 if i == 0 else 34                             # 뒷발은 반대 박자로
+            hlift = max(0.0, -4 * phase)
+            (a, b), (c, d) = P(hx - 7, -6 - hlift), P(hx + 7, 2 - hlift)
+            cv.create_oval(min(a, c), b, max(a, c), d, fill=fur, outline=INK, width=w * 0.8)
+    elif pose not in ("block",):                      # 앉아 있을 때 앞다리 두 줄 (발끝이 살짝 말린다)
+        stroke([(-10, -24), (-10, -4), (-6, -1)])
+        stroke([(10, -24), (10, -4), (6, -1)])
 
     # ---- 머리 (아래 테두리 없이 몸과 이어진다) ----
     flatten = 10 if pose == "angry" else 0            # 화나면 귀가 옆으로 눕는다
