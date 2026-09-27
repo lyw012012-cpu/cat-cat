@@ -137,9 +137,29 @@ class TestLadder(unittest.TestCase):
         probe = RecordingProbe([FUN] * 5 + [WindowInfo("main.py - VS Code", "Code.exe")])
         run(db, probe, 10.0, ctl, True, fetch=lambda vid: "Comedy")
         self.assertEqual(db.execute("SELECT seconds, response FROM block_event ORDER BY event_id").fetchall(),
-                         [(10, "warn"), (20, "mute"), (30, "delay"), (40, "close"), (50, "close")])
-        self.assertEqual(probe.calls, ["mute", "close", "close", "unmute"])   # VS Code로 옮기자 소리를 돌려줌
+                         [(10, "warn"), (20, "mute"), (30, "delay"), (40, "close"), (50, "warn")])   # 닫은 뒤엔 말하기부터
+        self.assertEqual(probe.calls, ["mute", "close", "unmute"])            # VS Code로 옮기자 소리를 돌려줌
         self.assertEqual(ctl.delay_request, cat_app.DELAY_SEC)
+
+    def test_ladder_repeats_after_close(self):
+        """한 판(말하기 → 소리 → 기다리게 → 닫기)이 끝나면 다음 딴짓도 똑같이 처음부터 — 바로 닫지 않는다."""
+        db = fast_db()
+        run(db, RecordingProbe([FUN] * 8), 10.0, Control("close"), True, fetch=lambda vid: "Comedy")
+        self.assertEqual([r for (r,) in db.execute("SELECT response FROM block_event ORDER BY event_id")],
+                         ["warn", "mute", "delay", "close"] * 2)
+
+    def test_system_windows_are_never_closed_or_asked(self):
+        """⚠️ 바탕화면(explorer.exe 'Program Manager')을 '딴짓'이라고 답했어도 닫거나 딴짓으로 세지 않는다."""
+        db = fast_db()
+        cat_app.save_site(db, "explorer.exe", "distract")               # 실수로 이렇게 답한 경우
+        desktop = WindowInfo("Program Manager", "explorer.exe")
+        probe = RecordingProbe([desktop] * 8)
+        ctl = Control("close")
+        run(db, probe, 10.0, ctl, True)
+        self.assertEqual(probe.calls, [])                                # 닫기 시도 없음
+        self.assertTrue(ctl.ui_requests.empty())                         # "이것도 공부야?"도 안 물음
+        self.assertEqual(db.execute("SELECT DISTINCT verdict FROM usage_session").fetchall(), [("unknown",)])
+        self.assertFalse(cat_app.block(probe, desktop))
 
     def test_never_skips_a_step(self):
         """이미 35초 본 상태(카테고리를 늦게 알았거나 아까 본 것)여도 첫 반응은 말하기부터 한 칸씩."""
@@ -175,7 +195,7 @@ class TestTalkAndCounts(unittest.TestCase):
         self.assertEqual(H(rules["r_shorts"], 0, "log", 0), "60분 더 보면 소리 안 들리게 할 거야.")
         self.assertEqual(H(rules["r_yt_warn"], 0, "close", 10), "10초 더 보면 소리 안 들리게 할 거야.")
         self.assertEqual(H(rules["r_yt_warn"], 2, "close", 30), "10초 더 보면 꺼 버릴 거야.")
-        self.assertEqual(H(rules["r_yt_warn"], 3, "close", 40), "계속 보면 계속 꺼 버릴 거야.")
+        self.assertEqual(H(rules["r_yt_warn"], 3, "close", 40), "또 보면 처음부터 다시 혼낼 거야.")
         self.assertEqual(H(rules["r_yt_warn"], 0, "log", 15 * 60), "45분 더 보면 소리 안 들리게 할 거야.")
         self.assertEqual([cat_app.fmt_time(x) for x in (40, 130, 600)], ["40초", "2분 10초", "10분"])
 

@@ -598,6 +598,14 @@ def _path(url: str | None) -> str:
 
 
 # ② 내장 목록 — 자주 쓰는 공부·업무 / 딴짓 앱·사이트 (특히 UT1에 빈 곳이 많은 한국 사이트)
+# ⚠️ Windows 시스템 화면: 절대 닫지 않고, 묻지 않고, 딴짓으로 세지 않는다.
+#    (explorer.exe 는 바탕화면 'Program Manager' 이기도 해서, 닫으면 Windows 종료 창이 뜰 수 있다)
+SYSTEM_APPS = {
+    "explorer.exe", "shellhost.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+    "searchhost.exe", "searchapp.exe", "taskmgr.exe", "lockapp.exe", "applicationframehost.exe",
+    "systemsettings.exe", "textinputhost.exe", "dwm.exe", "winlogon.exe", "consent.exe",
+}
+
 FOCUS_APPS = {
     "code.exe", "pycharm64.exe", "idea64.exe", "devenv.exe", "arduino ide.exe", "rstudio.exe", "matlab.exe",
     "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "notepad.exe", "notepad++.exe",
@@ -694,6 +702,8 @@ def classify(win, rules, sites: dict, decided: dict) -> str:
       쇼츠 규칙 → 유튜브 영상 종류 → 이번 실행 대답 → ③ 내 대답(배운 것) → ④ 경로 규칙
       → ② 내장 목록 → ① 공개 도메인 목록 → 제목 키워드 → 모름
     """
+    if not win.url and win.exe.lower() in SYSTEM_APPS:  # ⚠️ 바탕화면·탐색기·시작 메뉴 등 — 대답과 상관없이 중립
+        return "unknown"
     if pick_rule(rules, win):
         return "distract"
     kind = getattr(win, "video_kind", None)
@@ -965,7 +975,9 @@ def print_report(db: sqlite3.Connection, since: str | None = None) -> None:
 # =============================================================================
 
 def block(probe, win) -> bool:
-    """브라우저는 그 탭만(Ctrl+W), 다른 앱은 창을 닫는다."""
+    """브라우저는 그 탭만(Ctrl+W), 다른 앱은 창을 닫는다. Windows 시스템 화면은 절대 닫지 않는다."""
+    if win.exe.lower() in SYSTEM_APPS:
+        return False
     if win.exe.lower() in WindowsProbe.BROWSERS:
         return probe.close_tab(win.hwnd)
     return probe.close_window(win.hwnd)
@@ -1039,7 +1051,7 @@ def heads_up(rule: Rule, level: int, mode: str, seconds: int) -> str:
         if nxt == "warn":
             return ""
         if nxt == LADDER[min(level, ceiling)] == "close":
-            return "계속 보면 계속 꺼 버릴 거야."
+            return "또 보면 처음부터 다시 혼낼 거야."
         return f"{fmt_time(rule.step_sec)} 더 보면 {THREAT[nxt]}."
     if ceiling >= 1 and seconds < WATCH_MUTE_AFTER_SEC:    # 감시 모드: 1시간 되면 소리만
         return f"{-(-(WATCH_MUTE_AFTER_SEC - seconds) // 60)}분 더 보면 {THREAT['mute']}."
@@ -1411,8 +1423,8 @@ def respond(probe, ctl: Control, response: str, win) -> bool:
 
 
 def act(db: sqlite3.Connection, probe, ctl: Control, rule: Rule, win, level: int,
-        seconds: int, timed: bool) -> None:
-    """규칙 발동: 단계 결정 → 행동 → 모드·행동·성공 여부 기록 → 고양이 대사."""
+        seconds: int, timed: bool) -> str:
+    """규칙 발동: 단계 결정 → 행동 → 모드·행동·성공 여부 기록 → 고양이 대사. 한 행동을 돌려준다."""
     response = decide(rule, level, ctl.action, seconds)
     executed = respond(probe, ctl, response, win)
     save_event(db, rule, win, ctl.action, response, executed, seconds if timed else None)
@@ -1423,6 +1435,7 @@ def act(db: sqlite3.Connection, probe, ctl: Control, rule: Rule, win, level: int
         words.append(f"간식 -1 (남은 {ctl.mood[4]}개)")
     ctl.last = "🐱 " + " ".join(w for w in words if w)
     print(f"  {ctl.last}")
+    return response
 
 
 def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_empty: bool,
@@ -1471,6 +1484,7 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
     hunger_timer = 0.0                    # 🐟 마지막으로 배고파진 뒤 앱이 켜져 있던 시간
     # ponytail: 같은 구간에서 두 번 말하지 않게 메모리에만 기억. 하루에 앱을 다시 켜면 현재 구간을 한 번 더 말한다.
     fired: set[tuple] = set()
+    round_start: dict = {}                # 규칙별 '이번 판'이 시작된 반응 수 — 닫고 나면 말하기부터 다시
     streak = 0.0                          # 마지막 "어디야?" 이후 허용된 창에 있은 시간
     unknown_for: dict = {}                # 모르는 창(사이트/앱)별로 앞에 있던 시간
     asked: set = set()                    # 이번 실행에서 이미 물어본 창
@@ -1530,7 +1544,8 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
             if win is not None:
                 win = replace(win, verdict=verdict)         # 딴짓 규칙은 이 판정을 본다
             if ctl.action == "close" and win is not None:
-                if verdict == "unknown" and "youtube.com" not in _bare_host(win.url):
+                if (verdict == "unknown" and "youtube.com" not in _bare_host(win.url)
+                        and win.exe.lower() not in SYSTEM_APPS):
                     # 모르는 창 → 30초 넘으면 한 번 물어봄 (유튜브는 영상마다 따로 물으니 사이트 통째로는 안 물음)
                     key = window_key(win)
                     unknown_for[key] = unknown_for.get(key, 0) + elapsed
@@ -1577,12 +1592,14 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     step = seconds // rule.step_sec
                     key = (rule.rule_id, date.today(), step * rule.step_sec)
                     if step >= 1 and key not in fired:
-                        # 단계는 '오늘 몇 번째 반응인가' — 카테고리를 늦게 알아서 시간이 건너뛰어도
-                        # 말하기 → 소리 → 기다리게 → 닫기를 한 칸씩 밟는다.
-                        level = sum(1 for k in fired if k[:2] == key[:2])
+                        # 단계는 '이번 판에서 몇 번째 반응인가' — 시간이 건너뛰어도 한 칸씩 밟고,
+                        # 한 판(말하기 → 소리 → 기다리게 → 닫기)이 끝나면 다음 딴짓은 말하기부터 다시.
+                        count = sum(1 for k in fired if k[:2] == key[:2])
                         fired.add(key)
-                        act(db, probe, ctl, rule, win, level=level,
-                            seconds=step * rule.step_sec, timed=True)
+                        done = act(db, probe, ctl, rule, win, level=count - round_start.get(rule.rule_id, 0),
+                                   seconds=step * rule.step_sec, timed=True)
+                        if done == "close":
+                            round_start[rule.rule_id] = count + 1
             # 소리를 끈 뒤 규칙에 걸리지 않는 창(강의·다른 앱)으로 옮기면 소리를 돌려준다
             if ctl.muted_exe and not (win and any(rule_matches(r, win) for r in rules)):
                 unmute(probe, ctl)
