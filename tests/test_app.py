@@ -17,7 +17,7 @@ from cat_app import (Control, block, connect, load_rules, run, save_session,
                      single_instance, top_apps_today)
 from dataclasses import replace
 
-from watch import Session, WindowInfo, now_iso, pick_rule
+from watch import Condition, Rule, Session, WindowInfo, now_iso, pick_rule
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # 앱처럼 cp949 콘솔에서 이모지 출력 허용
@@ -612,6 +612,65 @@ class TestTimedRule(unittest.TestCase):
         db, probe, _ = self.run_on(61, "log")
         self.assertEqual(db.execute("SELECT response FROM block_event").fetchall(), [("mute",)])
         self.assertEqual(probe.calls, ["mute", "unmute"])            # 끝날 때 소리를 돌려줌
+
+
+class TestRuleCrud(unittest.TestCase):
+    """📋 규칙 만들기·고치기·끄기·지우기, 그리고 감시 루프가 바뀐 규칙을 바로 따르는지."""
+    INSTA = WindowInfo("인스타", "chrome.exe", "https://www.instagram.com/p/1")
+
+    def rule(self, db, **kw):
+        base = dict(rule_id=cat_app.new_rule_id(db), name="인스타", action="close", priority=cat_app.USER_RULE_PRIORITY,
+                    conditions=(Condition(0, "url", "contains", "instagram.com"),), reaction="", step_sec=0)
+        return Rule(**{**base, **kw})
+
+    def test_create_update_toggle_delete(self):
+        db = connect(":memory:")
+        r = self.rule(db)
+        cat_app.add_rule(db, r)
+        self.assertEqual(r.rule_id, "r_user_1")
+        self.assertEqual(pick_rule(load_rules(db), self.INSTA).rule_id, "r_user_1")
+        cat_app.update_rule(db, replace(r, name="게임", conditions=(Condition(0, "app", "eq", "game.exe"),)))
+        self.assertIsNone(pick_rule(load_rules(db), self.INSTA))                   # 조건이 통째로 바뀜
+        self.assertEqual([x.rule_id for x, _ in cat_app.rule_list(db)],             # 우선순위순 (같으면 만든 순서)
+                         ["r_shorts", "r_reels", "r_user_1", "r_yt_warn"])
+        cat_app.set_rule_enabled(db, r.rule_id, False)
+        self.assertNotIn(r.rule_id, [x.rule_id for x in load_rules(db)])
+        cat_app.save_event(db, r, self.INSTA, "close", "close", True)
+        cat_app.delete_rule(db, r.rule_id)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM rule_condition WHERE rule_id = 'r_user_1'").fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT rule_id FROM block_event").fetchall(), [(None,)])   # 기록은 남는다
+        self.assertEqual(cat_app.new_rule_id(db), "r_user_1")
+
+    def test_bad_rules_refused(self):
+        db = connect(":memory:")
+        for bad in (dict(name=" "), dict(conditions=(Condition(0, "app", "eq", ""),)),
+                    dict(conditions=(Condition(0, "url", "regex", "(("),)), dict(step_sec=-1)):
+            with self.assertRaises(ValueError):
+                cat_app.add_rule(db, self.rule(db, **bad))
+        with self.assertRaises(ValueError):
+            cat_app.delete_rule(db, "r_yt_warn")                                   # 기본 규칙은 끄기만
+        with self.assertRaises(ValueError):
+            cat_app.update_rule(db, self.rule(db, rule_id="r_nope"))
+
+    def test_loop_follows_rule_made_while_running(self):
+        db, ctl = connect(":memory:"), Control("close")
+        posts = [replace(self.INSTA, url=f"https://www.instagram.com/p/{i}") for i in range(3)]
+
+        def make_rule(left):
+            if left == 2:                                   # 첫 창을 본 뒤 규칙을 만든다
+                cat_app.add_rule(db, self.rule(db))
+                ctl.rules_changed = True
+        probe = RecordingProbe(posts, on_frame=make_rule)
+        run(db, probe, 0.0, ctl, True)
+        self.assertEqual(probe.calls, ["close", "close"])
+        self.assertIn("업무 중엔 안 돼.", ctl.last)
+
+    def test_one_ladder_when_my_rule_and_distract_rule_both_match(self):
+        db = fast_db()
+        cat_app.add_rule(db, self.rule(db, step_sec=10))
+        run(db, RecordingProbe([self.INSTA] * 4), 10.0, Control("close"), True)
+        self.assertEqual(db.execute("SELECT rule_id, response FROM block_event ORDER BY event_id").fetchall(),
+                         [("r_user_1", r) for r in ("warn", "mute", "delay", "close")])   # 딴짓 규칙은 조용
 
 
 class TestSessionsAndMigration(unittest.TestCase):

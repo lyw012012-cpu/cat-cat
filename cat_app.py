@@ -464,16 +464,106 @@ def save_rules(db: sqlite3.Connection, rules) -> None:
                             for c in r.conditions])
 
 
-def load_rules(db: sqlite3.Connection) -> list[Rule]:
+def rule_list(db: sqlite3.Connection) -> list[tuple[Rule, bool]]:
+    """꺼진 것까지 모든 규칙: [(규칙, 켜짐)] — 우선순위 순."""
     conds: dict[str, list[Condition]] = {}
     for rule_id, g, s, o, v in db.execute(
             "SELECT rule_id, group_no, subject, operator, value FROM rule_condition"
             " ORDER BY condition_id"):
         conds.setdefault(rule_id, []).append(Condition(g, s, o, v))
-    return [Rule(rid, name, action, prio, tuple(conds.get(rid, ())), reaction, step)
-            for rid, name, action, prio, reaction, step in db.execute(
-                "SELECT rule_id, name, action, priority, reaction, step_sec FROM block_rule"
-                " WHERE enabled = 1")]
+    return [(Rule(rid, name, action, prio, tuple(conds.get(rid, ())), reaction, step), bool(on))
+            for rid, name, action, prio, reaction, step, on in db.execute(
+                "SELECT rule_id, name, action, priority, reaction, step_sec, enabled FROM block_rule"
+                " ORDER BY priority, rowid")]          # 같은 우선순위는 만든 순서
+
+
+def load_rules(db: sqlite3.Connection) -> list[Rule]:
+    return [r for r, on in rule_list(db) if on]
+
+
+# ---- 규칙 CRUD (고양이 창 📋 규칙) --------------------------------------------
+BUILTIN_RULES = {r.rule_id for r in DEFAULT_RULES}   # 기본 규칙은 끄기만 되고 지울 수 없다
+USER_RULE_PRIORITY = 30                              # 쇼츠(10)보다 뒤, 딴짓(50)보다 먼저
+
+
+WHAT_LABEL = {("url", "contains"): "주소에 이 글자가 있으면",          # 규칙 창에서 고르는 조건 (하나짜리)
+              ("app", "eq"): "이 앱이면 (예: steam.exe)",
+              ("window_title", "contains"): "창 제목에 이 글자가 있으면"}
+STEP_LABEL = {"warn": "말하기", "mute": "소리 끄기", "delay": "10초 기다리게", "close": "닫기"}
+
+
+def rule_what_key(rule: Rule) -> tuple[str, str] | None:
+    """규칙 창에서 고칠 수 있는 조건 하나짜리 규칙이면 (subject, operator)."""
+    if len(rule.conditions) != 1:
+        return None
+    c = rule.conditions[0]
+    return (c.subject, c.operator) if (c.subject, c.operator) in WHAT_LABEL else None
+
+
+def rule_what(rule: Rule) -> str:
+    key = rule_what_key(rule)
+    if key:
+        return f"{WHAT_LABEL[key].split(' (')[0]}: {rule.conditions[0].value}"
+    if [(c.subject, c.value) for c in rule.conditions] == [("verdict", "distract")]:
+        return "고양이가 딴짓이라고 본 창"
+    return " 또는 ".join(c.value for c in rule.conditions) if len({c.group_no for c in rule.conditions}) == 1 \
+        else f"조건 {len(rule.conditions)}개"
+
+
+def check_rule(rule: Rule) -> None:
+    """사용자가 만든 규칙 검사 — 틀리면 ValueError (DB CHECK가 못 잡는 것만)."""
+    if not rule.name.strip():
+        raise ValueError("이름을 적어 줘")
+    if not rule.conditions or any(not c.value.strip() for c in rule.conditions):
+        raise ValueError("무엇을 막을지(값)를 적어 줘")
+    if rule.step_sec < 0:
+        raise ValueError("시간은 0 이상")
+    for c in rule.conditions:
+        if c.operator in ("regex", "not_regex"):
+            try:
+                re.compile(c.value)
+            except re.error as e:
+                raise ValueError(f"정규식 오류: {e}") from None
+
+
+def new_rule_id(db: sqlite3.Connection) -> str:
+    n = db.execute("SELECT COUNT(*) FROM block_rule WHERE rule_id LIKE 'r_user_%'").fetchone()[0] + 1
+    while db.execute("SELECT 1 FROM block_rule WHERE rule_id = ?", (f"r_user_{n}",)).fetchone():
+        n += 1
+    return f"r_user_{n}"
+
+
+def add_rule(db: sqlite3.Connection, rule: Rule) -> None:
+    check_rule(rule)
+    save_rules(db, [rule])
+
+
+def update_rule(db: sqlite3.Connection, rule: Rule) -> None:
+    """이름·단계·시간·대사를 고치고 조건은 통째로 바꾼다. rule_id는 그대로 → 지난 발동 기록이 이어진다."""
+    check_rule(rule)
+    with db:
+        cur = db.execute("UPDATE block_rule SET name = ?, action = ?, priority = ?, reaction = ?, step_sec = ?"
+                         " WHERE rule_id = ?",
+                         (rule.name, rule.action, rule.priority, rule.reaction, rule.step_sec, rule.rule_id))
+        if cur.rowcount == 0:
+            raise ValueError(f"없는 규칙: {rule.rule_id}")
+        db.execute("DELETE FROM rule_condition WHERE rule_id = ?", (rule.rule_id,))
+        db.executemany("INSERT INTO rule_condition (rule_id, group_no, subject, operator, value)"
+                       " VALUES (?, ?, ?, ?, ?)",
+                       [(rule.rule_id, c.group_no, c.subject, c.operator, c.value) for c in rule.conditions])
+
+
+def set_rule_enabled(db: sqlite3.Connection, rule_id: str, on: bool) -> None:
+    with db:
+        db.execute("UPDATE block_rule SET enabled = ? WHERE rule_id = ?", (int(on), rule_id))
+
+
+def delete_rule(db: sqlite3.Connection, rule_id: str) -> None:
+    """조건은 CASCADE로 같이 지워지고, 발동 기록(block_event)은 rule_id만 NULL이 되어 남는다."""
+    if rule_id in BUILTIN_RULES:
+        raise ValueError("기본 규칙은 지울 수 없어요 (끄기는 돼요)")
+    with db:
+        db.execute("DELETE FROM block_rule WHERE rule_id = ?", (rule_id,))
 
 
 def save_session(db: sqlite3.Connection, s: Session, verdict: str | None = None,
@@ -1016,6 +1106,7 @@ class Control:
         self.muted_exe: str | None = None    # 고양이가 소리를 끈 앱 (벗어나면 다시 켠다)
         self.site_kinds: dict = {}           # 사이트·앱 → (판정, 출처). 창에서 배우면 바로 여기에 더한다
         self.sites_changed = False           # 공개 목록을 새로 받았으니 다시 읽으라는 신호
+        self.rules_changed = False           # 📋 규칙을 바꿨으니 다시 읽으라는 신호
         self.eye_on = True                   # 👀 20-20-20 눈 쉬기 (고양이 창에서 끄고 켠다)
         self.mood = ("🐱", "보통", 1.0, 2, 0)  # 😺 (얼굴, 이름, 딴짓 간격 배수, 포만감, 간식 수)
         self.anims: queue.Queue = queue.Queue()  # 루프 → 움직이는 고양이: (자세, 초)
@@ -1046,7 +1137,9 @@ def heads_up(rule: Rule, level: int, mode: str, seconds: int) -> str:
     ceiling = LADDER.index(rule.action) if rule.action in LADDER else 0
     if mode == "close":
         if rule.step_sec == 0:                              # 쇼츠: 업무모드에선 바로 닫는다
-            return "업무 중엔 쇼츠 금지야." if ceiling == LADDER.index("close") else ""
+            if ceiling != LADDER.index("close"):
+                return ""
+            return "업무 중엔 쇼츠 금지야." if rule.rule_id in BUILTIN_RULES else "업무 중엔 안 돼."
         nxt = LADDER[min(level + 1, ceiling)]
         if nxt == "warn":
             return ""
@@ -1082,7 +1175,7 @@ FONT = "맑은 고딕"
 def control_window(ctl: Control, db_path: str = ":memory:") -> None:
     """
     바탕화면을 돌아다니는 고양이가 앱의 얼굴이다. 모든 조작은 고양이에게:
-      클릭 = 쓰다듬기 · 더블클릭 = 간식 주기 · 오른쪽 클릭 = 메뉴(모드, 눈 쉬기, 오늘 한 일, 배운 것, 끄기)
+      클릭 = 쓰다듬기 · 더블클릭 = 간식 주기 · 오른쪽 클릭 = 메뉴(모드, 눈 쉬기, 오늘 한 일, 배운 것, 규칙, 끄기)
     예전 '고양이 창'은 메뉴에서 여는 설정 패널이 됐다 (닫아도 고양이는 남는다).
     """
     import random
@@ -1247,10 +1340,110 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         tk.Button(pop, text="선택 지우기", command=remove).pack(pady=8)
         refresh()
 
+    def show_rules() -> None:
+        """📋 규칙 — 막을 사이트·앱을 만들고, 고치고, 끄고, 지운다. 바꾸면 감시 루프가 다음 틱에 다시 읽는다."""
+        pop = popup("규칙")
+        tk.Label(pop, text="📋 고양이 규칙 (위에 있을수록 먼저)", font=(FONT, 10, "bold"), pady=8).pack()
+        box = tk.Listbox(pop, width=70, height=10, font=(FONT, 9))
+        box.pack(padx=12)
+        msg = tk.Label(pop, fg="#c00", font=(FONT, 9))
+        items: list = []
+
+        def refresh() -> None:
+            box.delete(0, "end")
+            items[:] = rule_list(uidb)
+            for r, on in items:
+                when = "열자마자" if r.step_sec == 0 else f"{fmt_time(r.step_sec)}마다 한 단계"
+                box.insert("end", f"{'✅' if on else '⏸'}  {r.name}  —  {rule_what(r)}  →  "
+                                  f"최대 {STEP_LABEL[r.action]}, {when}")
+
+        def changed(text: str) -> None:
+            ctl.rules_changed = True
+            ctl.last = f"📋 {text}"
+            msg.config(text="")
+            refresh()
+
+        def selected():
+            sel = box.curselection()
+            return items[sel[0]] if sel else (None, None)
+
+        def toggle() -> None:
+            r, on = selected()
+            if r:
+                set_rule_enabled(uidb, r.rule_id, not on)
+                changed(f"{r.name} {'껐어' if on else '켰어'}")
+
+        def remove() -> None:
+            r, _ = selected()
+            if not r:
+                return
+            try:
+                delete_rule(uidb, r.rule_id)
+            except ValueError as e:
+                msg.config(text=str(e))
+                return
+            changed(f"{r.name} 지웠어")
+
+        def edit(rule: Rule | None) -> None:
+            form = popup("규칙 고치기" if rule else "새 규칙")
+            simple = rule is None or rule_what_key(rule) is not None     # 조건 하나짜리만 여기서 조건을 고친다
+            name = tk.StringVar(value=rule.name if rule else "")
+            what = tk.StringVar(value=WHAT_LABEL[rule_what_key(rule) if rule and simple else ("url", "contains")])
+            value = tk.StringVar(value=rule.conditions[0].value if rule and simple else "")
+            step = tk.StringVar(value=STEP_LABEL[rule.action if rule else "close"])
+            minutes = tk.StringVar(value=f"{rule.step_sec / 60:g}" if rule else "0")
+            reaction = tk.StringVar(value=rule.reaction if rule else "")
+            fields = (("이름", tk.Entry(form, textvariable=name, width=30)),
+                      ("무엇을", tk.OptionMenu(form, what, *WHAT_LABEL.values())),
+                      ("값", tk.Entry(form, textvariable=value, width=30)),
+                      ("최대 단계", tk.OptionMenu(form, step, *STEP_LABEL.values())),
+                      ("몇 분마다 (0 = 열자마자)", tk.Spinbox(form, from_=0, to=240, textvariable=minutes, width=6)),
+                      ("고양이 대사 ({time} = 누적 시간)", tk.Entry(form, textvariable=reaction, width=30)))
+            for i, (label, widget) in enumerate(fields):
+                tk.Label(form, text=label, font=(FONT, 9)).grid(row=i, column=0, sticky="e", padx=6, pady=3)
+                widget.grid(row=i, column=1, sticky="w", padx=6)
+                if not simple and label in ("무엇을", "값"):
+                    widget.config(state="disabled")                      # 여러 조건 규칙은 조건을 그대로 둔다
+            err = tk.Label(form, fg="#c00", font=(FONT, 9))
+            err.grid(row=len(fields), column=0, columnspan=2)
+
+            def save() -> None:
+                try:
+                    sec = int(float(minutes.get()) * 60)
+                except ValueError:
+                    err.config(text="분은 숫자로")
+                    return
+                if simple:
+                    subject, operator = next(k for k, v in WHAT_LABEL.items() if v == what.get())
+                    conds = (Condition(0, subject, operator, value.get().strip()),)
+                else:
+                    conds = rule.conditions
+                action = next(k for k, v in STEP_LABEL.items() if v == step.get())
+                new = Rule(rule.rule_id if rule else new_rule_id(uidb), name.get().strip(), action,
+                           rule.priority if rule else USER_RULE_PRIORITY, conds, reaction.get().strip(), sec)
+                try:
+                    (update_rule if rule else add_rule)(uidb, new)
+                except (ValueError, sqlite3.Error) as e:
+                    err.config(text=str(e))
+                    return
+                form.destroy()
+                changed(f"{new.name} {'고쳤어' if rule else '만들었어'}")
+
+            tk.Button(form, text="저장", command=save).grid(row=len(fields) + 1, column=0, columnspan=2, pady=8)
+
+        btns = tk.Frame(pop)
+        btns.pack(pady=8)
+        for text, cmd in (("➕ 새 규칙", lambda: edit(None)), ("✏️ 고치기", lambda: selected()[0] and edit(selected()[0])),
+                          ("⏯ 켜기/끄기", toggle), ("🗑 지우기", remove)):
+            tk.Button(btns, text=text, font=(FONT, 9), command=cmd).pack(side="left", padx=2)
+        msg.pack()
+        refresh()
+
     row = tk.Frame(root)
     row.pack()
     tk.Button(row, text="📊 오늘 한 일", font=(FONT, 9), command=show_today).pack(side="left", padx=2)
     tk.Button(row, text="🧠 배운 것", font=(FONT, 9), command=show_learned).pack(side="left", padx=2)
+    tk.Button(row, text="📋 규칙", font=(FONT, 9), command=show_rules).pack(side="left", padx=2)
     mood_label = tk.Label(root, font=(FONT, 9), pady=2)
     mood_label.pack()
     eye_var = tk.BooleanVar(value=ctl.eye_on)
@@ -1391,6 +1584,7 @@ def control_window(ctl: Control, db_path: str = ":memory:") -> None:
         None,
         ("📊 오늘 한 일", show_today),
         ("🧠 배운 것", show_learned),
+        ("📋 규칙", show_rules),
         ("⚙️ 고양이 창 열기", show_panel),
         None,
         ("👋 고양이 재우기 (끄기)", root.destroy),
@@ -1540,6 +1734,11 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
             if ctl.sites_changed:                           # 공개 목록을 새로 받음
                 ctl.sites_changed = False
                 ctl.site_kinds.update(load_site_kinds(db))
+            if ctl.rules_changed:                           # 📋 규칙 창에서 만들기·고치기·끄기·지우기
+                ctl.rules_changed = False
+                rules = load_rules(db)
+                instant = [r for r in rules if r.step_sec == 0]
+                timed = [r for r in rules if r.step_sec > 0]
             verdict = classify(win, rules, ctl.site_kinds, ctl.decided) if win else None
             if win is not None:
                 win = replace(win, verdict=verdict)         # 딴짓 규칙은 이 판정을 본다
@@ -1582,9 +1781,9 @@ def run(db: sqlite3.Connection, probe, interval: float, ctl: Control, stop_when_
                     act(db, probe, ctl, rule, win, level=0,
                         seconds=seconds_matching(db, rule), timed=False)
             if win is not None and not idle and tracker.current:
-                for rule in timed:                          # 딴짓 영상: 10초 구간을 넘을 때마다 한 단계씩
-                    if not rule_matches(rule, win):
-                        continue
+                # 딴짓: step_sec 구간을 넘을 때마다 한 단계씩. 내 규칙과 딴짓 규칙에 같이 걸리면 우선순위 높은 하나만
+                rule = pick_rule(timed, win)
+                if rule:
                     seconds = seconds_matching(db, rule, tracker.current.duration_sec)
                     # 😺 기분(포만감)만큼 간격을 늘이거나 줄인다 — 간식을 먹이면 그 자리에서 바뀐다
                     base_step = tm.step or rule.step_sec                   # 🧪 테스트 모드면 10초
