@@ -149,6 +149,6 @@ python tests/test_app.py     # SQLite 저장/조회
 ## 라이선스
 MIT
 
-고양이 디자인: **흰냥이** — 흰냥이의 손그림을 바탕으로 코드로 다시 그림 (원화는 저장소에 포함하지 않음)
+고양이 디자인: **흰냥이** — 저작권자 황가현에게 변형·수정 허락을 받음. 손그림을 바탕으로 코드로 다시 그림. 원화·참고 그림은 `설계/`에 있음
 
 사이트 분류 목록: [UT1 blacklists](https://dsi.ut-capitole.fr/blacklists/) (Université Toulouse Capitole, CC BY-SA 4.0) — 앱은 목록을 내려받아 쓰기만 하고 저장소에 포함하지 않는다.
